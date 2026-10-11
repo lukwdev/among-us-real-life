@@ -34,6 +34,7 @@ export default function Admin() {
     const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
     const [connectedPlayers, setConnectedPlayers] = useState([]);
     const [startError, setStartError] = useState('');
+    const [playerManagementMessage, setPlayerManagementMessage] = useState('');
 
     useEffect(() => {
         if (!loginAttempt) return;
@@ -159,6 +160,23 @@ export default function Admin() {
         socketRef.current?.emit('end-game');
     }
 
+    function removePlayer(player) {
+        if (gameActive || !window.confirm(`Remove ${player.name} from the saved player list?`)) return;
+        setPlayerManagementMessage('');
+        socketRef.current?.timeout(10000).emit('remove-player', { playerId: player.id }, (timeoutError, response) => {
+            if (timeoutError || !response?.ok) {
+                const messages = {
+                    'game-active': 'Players cannot be removed while a game is in progress.',
+                    'player-not-found': 'That player is no longer in the saved roster.',
+                    'persistence-unavailable': 'The player could not be removed because the server could not save the change.'
+                };
+                setPlayerManagementMessage(messages[response?.reason] || 'Could not remove the player. Check the connection and try again.');
+                return;
+            }
+            setPlayerManagementMessage(`${player.name} was removed.`);
+        });
+    }
+
     function login() {
         if (!adminCode) {
             setLoginError('Enter the admin code.');
@@ -221,6 +239,7 @@ export default function Admin() {
             <Stack spacing={2} alignItems="center" sx={{ py: 3 }}>
                 <Typography variant="overline">Admin ({authId})</Typography>
                 {startError && <Typography color="error" role="alert">{startError}</Typography>}
+                {playerManagementMessage && <Typography color="text.secondary" role="status">{playerManagementMessage}</Typography>}
 
                 {/* Connected Players Table */}
                 <Card sx={{ width: '100%', maxWidth: 820 }}>
@@ -234,12 +253,13 @@ export default function Admin() {
                                     <TableRow>
                                         <TableCell><strong>Name</strong></TableCell>
                                         <TableCell><strong>Status</strong></TableCell>
+                                        <TableCell><strong>Actions</strong></TableCell>
                                     </TableRow>
                                 </TableHead>
                                 <TableBody>
                                     {connectedPlayers.length === 0 ? (
                                         <TableRow>
-                                            <TableCell colSpan={2} align="center">
+                                            <TableCell colSpan={3} align="center">
                                                 <Typography variant="body2" color="text.secondary">No players have logged in yet</Typography>
                                             </TableCell>
                                         </TableRow>
@@ -252,6 +272,17 @@ export default function Admin() {
                                                         {player.connected ? 'Connected' : 'Offline'}
                                                         {player.alive === false ? ' · Dead' : ''}
                                                     </Typography>
+                                                </TableCell>
+                                                <TableCell>
+                                                    <IconButton
+                                                        aria-label={`Remove ${player.name}`}
+                                                        color="error"
+                                                        disabled={gameActive}
+                                                        onClick={() => removePlayer(player)}
+                                                        size="small"
+                                                    >
+                                                        <DeleteIcon />
+                                                    </IconButton>
                                                 </TableCell>
                                             </TableRow>
                                         ))

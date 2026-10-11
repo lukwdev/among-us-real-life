@@ -32,6 +32,8 @@ export default function Player() {
   const [pushSubscriptionSaved, setPushSubscriptionSaved] = useState(false);
   const audioRef = useRef(null);
   const socketRef = useRef(null);
+  const authIdRef = useRef(authId);
+  authIdRef.current = authId;
   const playerActionsRef = useRef({});
   const [meeting, setMeeting] = useState(false);
   const [gameActive, setGameActive] = useState(false);
@@ -97,6 +99,23 @@ export default function Player() {
       });
     });
     socket.on('disconnect', () => setIsConnected(false));
+    socket.on('player-removed', () => {
+      try {
+        localStorage.removeItem('playerName');
+        localStorage.removeItem(`imp_completed_${authIdRef.current}`);
+      } catch (error) {
+        console.warn('Could not clear saved player data after roster removal.', error);
+      }
+      setPlayerName('');
+      setNameInput('');
+      setAuthId('');
+      setTasks({});
+      setCompleted({});
+      setRole('');
+      setIsImpostor(false);
+      setLoginError('Your saved player profile was removed by the admin. Enter your name to join again.');
+      socket.disconnect();
+    });
 
     socket.on('tasks', (t) => { setTasks(t || {}); });
     socket.on('progress', (p) => { setProgress(p || 0); });

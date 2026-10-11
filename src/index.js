@@ -214,6 +214,61 @@ io.on('connection', socket => {
 		console.log('[player-login]', { socketId: socket.id, playerId: playerKey });
 	});
 
+	socket.on('remove-player', (payload, acknowledge) => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		const playerId = typeof payload?.playerId === 'string' ? payload.playerId : '';
+		if (!socket.data.isAdmin) {
+			return reply({ ok: false, reason: 'unauthorized' });
+		}
+		if (isGameActive) {
+			return reply({ ok: false, reason: 'game-active' });
+		}
+		if (!playerId || !playerDirectory[playerId]) {
+			return reply({ ok: false, reason: 'player-not-found' });
+		}
+
+		const previousState = {
+			playerDirectory,
+			authToPlayer,
+			pushSubscriptions,
+			killCooldownEndMsByAuth,
+			impostorAuths,
+			deadAuths
+		};
+		playerDirectory = Object.assign(Object.create(null), playerDirectory);
+		authToPlayer = Object.assign(Object.create(null), authToPlayer);
+		pushSubscriptions = Object.assign(Object.create(null), pushSubscriptions);
+		killCooldownEndMsByAuth = Object.assign(Object.create(null), killCooldownEndMsByAuth);
+		impostorAuths = new Set(impostorAuths);
+		deadAuths = new Set(deadAuths);
+		delete playerDirectory[playerId];
+		delete authToPlayer[playerId];
+		delete pushSubscriptions[playerId];
+		delete killCooldownEndMsByAuth[playerId];
+		impostorAuths.delete(playerId);
+		deadAuths.delete(playerId);
+
+		if (!persistState()) {
+			playerDirectory = previousState.playerDirectory;
+			authToPlayer = previousState.authToPlayer;
+			pushSubscriptions = previousState.pushSubscriptions;
+			killCooldownEndMsByAuth = previousState.killCooldownEndMsByAuth;
+			impostorAuths = previousState.impostorAuths;
+			deadAuths = previousState.deadAuths;
+			return reply({ ok: false, reason: 'persistence-unavailable' });
+		}
+
+		for (const playerSocket of io.of('/').sockets.values()) {
+			if (playerSocket.data.playerId === playerId) {
+				playerSocket.emit('player-removed');
+				playerSocket.disconnect(true);
+			}
+		}
+		reply({ ok: true });
+		broadcastPlayersToAdmins();
+		console.log('[player-removed]', { playerId });
+	});
+
 	socket.on('get-push-config', acknowledge => {
 		if (typeof acknowledge === 'function') {
 			acknowledge({ enabled: pushEnabled, publicKey: pushEnabled ? vapidPublicKey : null });
