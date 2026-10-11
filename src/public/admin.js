@@ -5,8 +5,37 @@ const socket = io({
 });
 
 const startGame$ = document.querySelector('#start-game');
+const players$ = document.querySelector('#players');
+const playerCount$ = document.querySelector('#player-count');
+const adminError$ = document.querySelector('#admin-error');
+
+function renderPlayers(players) {
+	const connectedCount = players.filter(player => player.connected).length;
+	playerCount$.textContent = `${connectedCount} connected / ${players.length} total`;
+	players$.replaceChildren();
+	for (const player of players) {
+		const item = document.createElement('li');
+		item.textContent = `${player.name}: ${player.connected ? 'Connected' : 'Offline'}${player.alive ? '' : ' · Dead'}`;
+		players$.appendChild(item);
+	}
+}
+
+socket.on('state', state => {
+	if (Array.isArray(state?.players)) renderPlayers(state.players);
+});
+
+socket.on('players-updated', players => {
+	if (Array.isArray(players)) renderPlayers(players);
+});
+
+socket.on('start-error', error => {
+	adminError$.textContent = error?.reason === 'no-players'
+		? 'At least one player must be connected before starting.'
+		: 'The game could not be started.';
+});
 
 startGame$.addEventListener('click', () => {
+	adminError$.textContent = '';
 	socket.emit('start-game');
 });
 

@@ -1,0 +1,16 @@
+services:
+  frontend:
+    build:
+      dockerfile: Dockerfile-Frontend
+    ports:
+      - "8080:80"
+  backend:
+    build:
+      dockerfile: Dockerfile-Backend
+    environment:
+      DATA_DIR: /home/node/app/data
+    volumes:
+      - game-data:/home/node/app/data
+
+volumes:
+  game-data:

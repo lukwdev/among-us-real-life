@@ -4,12 +4,59 @@ const socket = io({
 	}
 });
 
+const login$ = document.querySelector('#player-login');
+const playerName$ = document.querySelector('#player-name');
+const loginError$ = document.querySelector('#login-error');
+const game$ = document.querySelector('#game');
+const connectionState$ = document.querySelector('#connection-state');
 const emergencyMeeting$ = document.querySelector('#emergency-meeting');
 const enableSound$ = document.querySelector('#enable-sound');
 const progress$ = document.querySelector('#progress');
 const progressBar$ = document.querySelector('.progress-bar');
 const report$ = document.querySelector('#report');
 const tasks$ = document.querySelector('#tasks');
+
+function loginPlayer(name) {
+	socket.timeout(10000).emit('player-login', { name }, (timeoutError, response) => {
+		if (timeoutError || !response?.ok) {
+			loginError$.textContent = response?.reason === 'name-in-use'
+				? 'That name is already connected. Choose a different name.'
+				: 'Could not connect with that name. Please try again.';
+			login$.hidden = false;
+			game$.hidden = true;
+			return;
+		}
+		try {
+			localStorage.setItem('playerName', response.name);
+		} catch (error) {
+			console.warn('Could not save the player name in browser storage.', error);
+		}
+		loginError$.textContent = '';
+		connectionState$.textContent = 'Connected';
+		login$.hidden = true;
+		game$.hidden = false;
+	});
+}
+
+socket.on('connect', () => {
+	connectionState$.textContent = 'Connecting…';
+	try {
+		const savedName = localStorage.getItem('playerName');
+		if (savedName) playerName$.value = savedName;
+	} catch (error) {
+		console.warn('Could not read the saved player name.', error);
+	}
+	if (playerName$.value.trim()) loginPlayer(playerName$.value.trim());
+});
+
+socket.on('disconnect', () => {
+	connectionState$.textContent = 'Connection lost. Reconnecting…';
+});
+
+login$.addEventListener('submit', event => {
+	event.preventDefault();
+	loginPlayer(playerName$.value.trim());
+});
 
 report$.addEventListener('click', () => {
 	socket.emit('report');

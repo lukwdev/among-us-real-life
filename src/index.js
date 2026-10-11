@@ -2,6 +2,7 @@ const PORT = process.env.PORT || 4046;
 
 const express = require('express');
 const http = require('http');
+const fs = require('fs');
 const _ = require('lodash');
 const path = require('path');
 const { Server } = require('socket.io');
@@ -57,15 +58,17 @@ const TASKS = [
 ];
 const N_TASKS = 5;
 const N_IMPOSTORS = 1;
+const DEFAULT_TASKS_PER_PLAYER = N_TASKS;
 
-let taskProgress = {};
+let taskProgress = Object.create(null);
 let isMeeting = false;
 let isGameActive = false;
 let gameConfig = {
 	tasks: TASKS,
 	numImpostors: N_IMPOSTORS,
-	emergencyCooldownMinutes: 0,
-	killCooldownSeconds: 0,
+	numTasksPerPlayer: DEFAULT_TASKS_PER_PLAYER,
+	emergencyCooldownMinutes: 1,
+	killCooldownSeconds: 20,
 	// Max number of players that can receive the same task label
 	maxPlayersPerTask: 2,
 	// New: sabotage duration in seconds
@@ -79,15 +82,22 @@ let impostorIds = new Set();
 let killCooldownEndMsBySocketId = {};
 // Auth-based mappings for reconnect/rehydration
 let socketIdToAuth = {};
-let authToPlayer = {}; // auth -> { role: string, tasks: { [taskId]: label } }
+let authToPlayer = Object.create(null); // auth -> { role: string, tasks: { [taskId]: label } }
 let impostorAuths = new Set();
-let killCooldownEndMsByAuth = {};
+let killCooldownEndMsByAuth = Object.create(null);
 // Sabotage state
 let isSabotageActive = false;
 let sabotageEndMs = 0;
 let sabotageTimeout = null;
 let sabotageUsedAuths = new Set();
 let sabotageChargesRemaining = 0;
+
+let deadAuths = new Set();
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
+const STATE_FILE = path.join(DATA_DIR, 'game-state.json');
+let playerDirectory = Object.create(null);
+
+loadPersistentState();
 
 app.use('/', express.static(path.join(__dirname, 'public')));
 
@@ -120,7 +130,8 @@ io.on('connection', socket => {
 	console.log('[connect] socket', socket.id, 'auth', auth);
 
 	// Send current state to newly connected clients
-	socket.emit('state', { isMeeting, isGameActive, emergencyCooldownEndMs, config: gameConfig, sabotageEndMs, sabotageChargesRemaining });
+	socket.emit('state', getStateSnapshot());
+	broadcastPlayersToAdmins();
 
 	// If the connecting socket is an impostor, send its kill cooldown snapshot
 	if (isGameActive && impostorIds.has(socket.id)) {
@@ -145,75 +156,66 @@ io.on('connection', socket => {
 
 	// Allow clients to request a fresh snapshot of state
 	socket.on('get-state', () => {
-		socket.emit('state', { isMeeting, isGameActive, emergencyCooldownEndMs, config: gameConfig, sabotageEndMs, sabotageChargesRemaining });
+		socket.emit('state', getStateSnapshot());
 		console.log('[get-state]', { socketId: socket.id, auth: socketIdToAuth[socket.id], isMeeting, isGameActive, emergencyCooldownEndMs });
+	});
+
+	socket.on('player-login', (payload, acknowledge) => {
+		const name = typeof payload?.name === 'string' ? payload.name.trim() : '';
+		const playerKey = name.toLowerCase();
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+
+		if (socket.handshake.query.role !== 'PLAYER') {
+			return reply({ ok: false, reason: 'invalid-role' });
+		}
+		if (!name || name.length > 32 || /[\u0000-\u001f\u007f]/.test(name)) {
+			return reply({ ok: false, reason: 'invalid-name' });
+		}
+		const nameInUse = Array.from(io.of('/').sockets.values()).some(other =>
+			other.id !== socket.id && other.data.playerId === playerKey
+		);
+		if (nameInUse) {
+			return reply({ ok: false, reason: 'name-in-use' });
+		}
+
+		const existingPlayer = playerDirectory[playerKey];
+		if (!existingPlayer) {
+			playerDirectory[playerKey] = { id: playerKey, name, lastSeenMs: Date.now() };
+			if (!persistState()) {
+				delete playerDirectory[playerKey];
+				return reply({ ok: false, reason: 'persistence-unavailable' });
+			}
+		} else if (existingPlayer.name !== name) {
+			const previousName = existingPlayer.name;
+			existingPlayer.name = name;
+			if (!persistState()) {
+				existingPlayer.name = previousName;
+				return reply({ ok: false, reason: 'persistence-unavailable' });
+			}
+		}
+
+		socket.data.playerId = playerKey;
+		socketIdToAuth[socket.id] = playerKey;
+		reply({ ok: true, id: playerKey, name: playerDirectory[playerKey].name });
+		socket.emit('state', getStateSnapshot());
+		sendPlayerSnapshot(socket, playerKey);
+		broadcastPlayersToAdmins();
+		console.log('[player-login]', { socketId: socket.id, playerId: playerKey });
 	});
 
 	// Rehydration: client asks who am I with its auth
 	socket.on('whoami', (payload) => {
-		const incomingAuth = (payload && typeof payload === 'object' && payload.auth) ? String(payload.auth) : (socket.handshake.query.auth || socket.id);
-		// Update mapping so subsequent events use this auth
-		socketIdToAuth[socket.id] = incomingAuth;
-		let info = authToPlayer[incomingAuth];
-		// If not found, check if we accidentally stored by socket.id and migrate
-		if (!info && authToPlayer[socket.id]) {
-			authToPlayer[incomingAuth] = authToPlayer[socket.id];
-			delete authToPlayer[socket.id];
-			// Migrate impostor/auth cooldown mappings if present
-			if (impostorAuths.has(socket.id)) {
-				impostorAuths.delete(socket.id);
-				impostorAuths.add(incomingAuth);
-			}
-			if (typeof killCooldownEndMsByAuth[socket.id] !== 'undefined') {
-				killCooldownEndMsByAuth[incomingAuth] = killCooldownEndMsByAuth[socket.id];
-				delete killCooldownEndMsByAuth[socket.id];
-			}
-			info = authToPlayer[incomingAuth];
-		}
-		// Always send state snapshot
-		socket.emit('state', { isMeeting, isGameActive, emergencyCooldownEndMs, config: gameConfig, sabotageEndMs, sabotageChargesRemaining });
-		console.log('[whoami]', { socketId: socket.id, incomingAuth, found: !!info, role: info?.role, tasks: info ? Object.keys(info.tasks || {}).length : 0, impostor: impostorAuths.has(incomingAuth) });
-		if (!info) {
-			// If game is starting, assignment might still be in-flight. Retry once shortly.
-			setTimeout(() => {
-				const later = authToPlayer[incomingAuth];
-				if (!later) return;
-				if (later.role) socket.emit('role', later.role);
-				if (later.tasks) socket.emit('tasks', later.tasks);
-				socket.emit('tasks-completed', getCompletionMapForAuth(incomingAuth));
-				const vals = Object.values(taskProgress);
-				const ratio = vals.length ? vals.filter(Boolean).length / vals.length : 0;
-				socket.emit('progress', ratio);
-				if (impostorAuths.has(incomingAuth)) {
-					impostorIds.add(socket.id);
-					const endMs = killCooldownEndMsByAuth[incomingAuth] || 0;
-					killCooldownEndMsBySocketId[socket.id] = endMs;
-					socket.emit('kill-cooldown-updated', { endMs });
-				}
-			}, 300);
-			return;
-		}
-		if (info.role) socket.emit('role', info.role);
-		if (info.tasks) socket.emit('tasks', info.tasks);
-		socket.emit('tasks-completed', getCompletionMapForAuth(incomingAuth));
-		// Hydrate sabotage status
-		socket.emit('sabotage-usage', { used: sabotageUsedAuths.has(incomingAuth) });
-		if (isSabotageActive && sabotageEndMs > Date.now()) {
-			socket.emit('sabotage-started', { endMs: sabotageEndMs });
-		}
-		// Send current progress so the client can hydrate the progress bar
-		const vals = Object.values(taskProgress);
-		const ratio = vals.length ? vals.filter(Boolean).length / vals.length : 0;
-		socket.emit('progress', ratio);
-		if (impostorAuths.has(incomingAuth)) {
-			impostorIds.add(socket.id);
-			const endMs = killCooldownEndMsByAuth[incomingAuth] || 0;
-			killCooldownEndMsBySocketId[socket.id] = endMs;
-			socket.emit('kill-cooldown-updated', { endMs });
-		}
+		const playerId = socket.data.playerId;
+		if (playerId) sendPlayerSnapshot(socket, playerId);
 	});
 
 	socket.on('start-game', payload => {
+		if (socket.handshake.query.role !== 'ADMIN') {
+			return socket.emit('start-error', { reason: 'unauthorized' });
+		}
+		if (isGameActive) {
+			return socket.emit('start-error', { reason: 'game-already-active' });
+		}
 		// Update runtime config from admin payload if provided
 		if (payload && typeof payload === 'object') {
 			if (Array.isArray(payload.tasks) && payload.tasks.length > 0) {
@@ -221,6 +223,12 @@ io.on('connection', socket => {
 			}
 			if (typeof payload.numImpostors === 'number' && payload.numImpostors >= 0) {
 				gameConfig.numImpostors = payload.numImpostors;
+			}
+			if (typeof payload.numTasksPerPlayer === 'number' && payload.numTasksPerPlayer > 0) {
+				const taskPoolSize = Array.isArray(payload.tasks) && payload.tasks.length > 0
+					? payload.tasks.length
+					: gameConfig.tasks.length;
+				gameConfig.numTasksPerPlayer = Math.min(Math.floor(payload.numTasksPerPlayer), Math.max(1, taskPoolSize));
 			}
 			if (typeof payload.emergencyCooldownMinutes === 'number' && payload.emergencyCooldownMinutes >= 0) {
 				gameConfig.emergencyCooldownMinutes = payload.emergencyCooldownMinutes;
@@ -242,7 +250,7 @@ io.on('connection', socket => {
 		// Get player sockets
 		const players = [];
 		for (const [_, socket] of io.of('/').sockets) {
-			if (socket.handshake.query.role === 'PLAYER') {
+			if (socket.handshake.query.role === 'PLAYER' && socket.data.playerId) {
 				players.push(socket);
 			}
 		}
@@ -259,18 +267,20 @@ io.on('connection', socket => {
 		const impostors = _.shuffle(playerIds).slice(0, impostorCount);
 		impostorIds = new Set(impostors);
 		// Build auth mapping for players and reset persisted maps
-		const authBySocketId = {};
+		const authBySocketId = Object.create(null);
 		for (const p of players) {
-			authBySocketId[p.id] = p.handshake.query.auth || p.id;
+			authBySocketId[p.id] = p.data.playerId || p.handshake.query.auth || p.id;
 		}
 		impostorAuths = new Set(impostors.map(id => authBySocketId[id]));
 		const uniqueAuths = Array.from(new Set(Object.values(authBySocketId)));
 		console.log('[start-game] impostors (socketIds)', Array.from(impostorIds));
 		console.log('[start-game] impostors (auths)', Array.from(impostorAuths));
 		console.log('[start-game] unique players (auths)', uniqueAuths);
-		authToPlayer = {};
-		killCooldownEndMsByAuth = {};
+		authToPlayer = Object.create(null);
+		killCooldownEndMsByAuth = Object.create(null);
 		killCooldownEndMsBySocketId = {};
+        //Reset dead players
+        deadAuths = new Set();
 		// Reset sabotage state
 		isSabotageActive = false;
 		sabotageEndMs = 0;
@@ -305,35 +315,36 @@ io.on('connection', socket => {
 		// Assign tasks with per-player uniqueness and global per-task cap
 		const tasksPool = Array.isArray(gameConfig.tasks) ? gameConfig.tasks.slice() : [];
 		const maxPerTask = Math.max(1, Number(gameConfig.maxPlayersPerTask || 2));
-		const assignedCountByTask = {};
+		const desiredTaskCount = Math.max(1, Number(gameConfig.numTasksPerPlayer || DEFAULT_TASKS_PER_PLAYER));
+		const tasksPerPlayer = Math.min(desiredTaskCount, Math.max(1, tasksPool.length || 1));
+		const assignedCountByTask = Object.create(null);
 		for (const t of tasksPool) assignedCountByTask[t] = 0;
 
 		// Track each player's assigned labels to enforce uniqueness
-		const playerTaskLabels = {};
-		const playerTasks = {};
+		const playerTaskLabels = Object.create(null);
+		const playerTasks = Object.create(null);
 		taskProgress = {};
 		for (const a of uniqueAuths) {
 			playerTaskLabels[a] = new Set();
 			playerTasks[a] = {};
 		}
 
-		for (let i = 0; i < N_TASKS; i++) {
+		for (let i = 0; i < tasksPerPlayer; i++) {
 			for (const a of uniqueAuths) {
 				const labelSet = playerTaskLabels[a];
-				// Preferred candidates: not already assigned to this player AND under cap
-				let candidates = tasksPool.filter(t => !labelSet.has(t) && (assignedCountByTask[t] || 0) < maxPerTask);
-				// Fallback if cap is too strict: allow any not-yet-assigned-to-this-player
+				const eligible = tasksPool.filter(taskLabel => {
+					return !labelSet.has(taskLabel) && (assignedCountByTask[taskLabel] || 0) < maxPerTask;
+				});
+				let candidates = eligible;
 				if (candidates.length === 0) {
-					candidates = tasksPool.filter(t => !labelSet.has(t));
+					candidates = tasksPool.filter(taskLabel => !labelSet.has(taskLabel));
 				}
-				// If still none, we cannot assign more unique tasks to this player
 				if (candidates.length === 0) {
 					continue;
 				}
-				// Choose among least-used tasks to balance distribution
-				const minCount = Math.min(...candidates.map(t => assignedCountByTask[t] || 0));
-				const leastUsed = candidates.filter(t => (assignedCountByTask[t] || 0) === minCount);
-				const taskLabel = _.shuffle(leastUsed)[0];
+				const minCount = Math.min(...candidates.map(taskLabel => assignedCountByTask[taskLabel] || 0));
+				const taskLabel = _.shuffle(candidates.filter(taskLabel => (assignedCountByTask[taskLabel] || 0) === minCount))[0];
+				if (!taskLabel) continue;
 
 				labelSet.add(taskLabel);
 				assignedCountByTask[taskLabel] = (assignedCountByTask[taskLabel] || 0) + 1;
@@ -350,6 +361,16 @@ io.on('connection', socket => {
 
 		console.log('player tasks', playerTasks);
 
+		// Save assignments before sending completion snapshots to players.
+		for (const a of uniqueAuths) {
+			const role = impostorAuths.has(a) ? 'Impostor' : 'Crewmate';
+			authToPlayer[a] = {
+				...authToPlayer[a],
+				role,
+				tasks: playerTasks[a] || {}
+			};
+		}
+
 		for (const [id, socket] of io.of('/').sockets) {
 			if (playerIds.includes(id)) {
 				const a = authBySocketId[id] || id;
@@ -361,14 +382,6 @@ io.on('connection', socket => {
 				const ratio = vals.length ? vals.filter(Boolean).length / vals.length : 0;
 				socket.emit('progress', ratio);
 			}
-		}
-
-		// Persist assigned role and tasks by auth
-		for (const a of uniqueAuths) {
-			const role = impostorAuths.has(a) ? 'Impostor' : 'Crewmate';
-			authToPlayer[a] = authToPlayer[a] || {};
-			authToPlayer[a].role = role;
-			authToPlayer[a].tasks = playerTasks[a] || {};
 		}
 
 		// Broadcast initial sabotage charges to all clients
@@ -383,30 +396,33 @@ io.on('connection', socket => {
 		lastMeetingType = null;
 		io.emit('game-started');
 		io.emit('cooldown-updated', { emergencyCooldownEndMs });
+		persistState();
 		console.log('[game-started]');
 	});
 
 	socket.on('report', () => {
-		if (!isGameActive || isMeeting) return;
+		if (!socket.data.playerId || !isGameActive || isMeeting) return;
 		isMeeting = true;
 		lastMeetingType = 'report';
 		io.emit('play-meeting');
 		io.emit('meeting-started');
+		persistState();
 		console.log('[report]', { socketId: socket.id, auth: socketIdToAuth[socket.id] });
 	});
 
 	socket.on('emergency-meeting', () => {
-		if (!isGameActive || isMeeting) return;
+		if (!socket.data.playerId || !isGameActive || isMeeting) return;
 		if (Date.now() < emergencyCooldownEndMs) return;
 		isMeeting = true;
 		lastMeetingType = 'emergency';
 		io.emit('play-meeting');
 		io.emit('meeting-started');
+		persistState();
 		console.log('[emergency-meeting]', { socketId: socket.id, auth: socketIdToAuth[socket.id] });
 	});
 
 	socket.on('continue-game', () => {
-		if (!isGameActive) return;
+		if (socket.handshake.query.role !== 'ADMIN' || !isGameActive) return;
 		isMeeting = false;
 		// Reset kill cooldown for all impostors at the end of a meeting
 		const killMs = Math.max(0, (gameConfig.killCooldownSeconds || 0) * 1000);
@@ -426,18 +442,21 @@ io.on('connection', socket => {
 		}
 		io.emit('meeting-ended');
 		io.emit('cooldown-updated', { emergencyCooldownEndMs });
+		persistState();
 		console.log('[meeting-ended]', { emergencyCooldownEndMs });
 	});
 
 	socket.on('end-game', () => {
-		if (!isGameActive) return;
+		if (socket.handshake.query.role !== 'ADMIN' || !isGameActive) return;
 		isMeeting = false;
 		isGameActive = false;
 		emergencyCooldownEndMs = 0;
 		impostorIds = new Set();
 		impostorAuths = new Set();
 		killCooldownEndMsBySocketId = {};
-		killCooldownEndMsByAuth = {};
+		killCooldownEndMsByAuth = Object.create(null);
+        // Reset dead players
+        deadAuths = new Set();
 		// Clear sabotage
 		isSabotageActive = false;
 		sabotageEndMs = 0;
@@ -453,14 +472,17 @@ io.on('connection', socket => {
 				authToPlayer[key].role = '';
 			}
 		}
+		taskProgress = Object.create(null);
 		io.emit('game-ended');
 		io.emit('cooldown-updated', { emergencyCooldownEndMs });
+		persistState();
+		broadcastPlayersToAdmins();
 		console.log('[game-ended]');
 	});
 
 	// Impostor kill attempt
 	socket.on('kill', () => {
-		if (!isGameActive || isMeeting) return;
+		if (!socket.data.playerId || !isGameActive || isMeeting) return;
 		if (!impostorIds.has(socket.id)) return;
 		const now = Date.now();
 		const endMs = killCooldownEndMsBySocketId[socket.id] || 0;
@@ -470,12 +492,13 @@ io.on('connection', socket => {
 		const a = socketIdToAuth[socket.id];
 		if (a) killCooldownEndMsByAuth[a] = killCooldownEndMsBySocketId[socket.id];
 		socket.emit('kill-cooldown-updated', { endMs: killCooldownEndMsBySocketId[socket.id] });
+		persistState();
 		console.log('[kill]', { socketId: socket.id, auth: a, endMs: killCooldownEndMsBySocketId[socket.id] });
 	});
 
 	// Impostor sabotage attempt (one-time per impostor)
 	socket.on('sabotage', () => {
-		if (!isGameActive || isMeeting) return;
+		if (!socket.data.playerId || !isGameActive || isMeeting) return;
 		if (!impostorIds.has(socket.id)) return;
 		const a = socketIdToAuth[socket.id];
 		if (!a) return;
@@ -492,17 +515,19 @@ io.on('connection', socket => {
 		io.emit('sabotage-charges', { remaining: sabotageChargesRemaining });
 		// Also inform this impostor they've used their sabotage
 		socket.emit('sabotage-usage', { used: true });
+		persistState();
 		if (sabotageTimeout) clearTimeout(sabotageTimeout);
 		sabotageTimeout = setTimeout(() => {
 			isSabotageActive = false;
 			sabotageEndMs = 0;
 			io.emit('sabotage-ended');
 			sabotageTimeout = null;
+			persistState();
 		}, durationMs);
 	});
 
 	socket.on('task-complete', taskId => {
-		if (isMeeting || !isGameActive) return;
+		if (!socket.data.playerId || isMeeting || !isGameActive) return;
 		if (typeof taskProgress[taskId] === 'boolean') {
 			taskProgress[taskId] = true;
 		}
@@ -512,10 +537,11 @@ io.on('connection', socket => {
 		if (a) {
 			socket.emit('tasks-completed', getCompletionMapForAuth(a));
 		}
+		persistState();
 	});
 
 	socket.on('task-incomplete', taskId => {
-		if (isMeeting || !isGameActive) return;
+		if (!socket.data.playerId || isMeeting || !isGameActive) return;
 		if (typeof taskProgress[taskId] === 'boolean') {
 			taskProgress[taskId] = false;
 		}
@@ -525,22 +551,199 @@ io.on('connection', socket => {
 		if (a) {
 			socket.emit('tasks-completed', getCompletionMapForAuth(a));
 		}
+		persistState();
 	});
+
+    // NEW: Player marks themselves as dead
+    socket.on('mark-dead', () => {
+        if (!socket.data.playerId || !isGameActive) return;
+        const auth = socketIdToAuth[socket.id];
+        if (!auth) return;
+        // Only crewmates can mark themselves as dead
+        if (impostorAuths.has(auth)) return;
+
+        deadAuths.add(auth);
+		persistState();
+        console.log('[mark-dead]', { socketId: socket.id, auth });
+
+        // Broadcast updated player list and alive count
+        broadcastPlayersToAdmins();
+        broadcastAliveCount();
+    });
 
 	socket.on('disconnect', () => {
 		delete killCooldownEndMsBySocketId[socket.id];
+		const playerId = socket.data.playerId;
+		if (playerId && playerDirectory[playerId]) {
+			playerDirectory[playerId].lastSeenMs = Date.now();
+			persistState();
+		}
 		delete socketIdToAuth[socket.id];
+		broadcastPlayersToAdmins();
 	});
 });
+
+function getStateSnapshot() {
+	return {
+		isMeeting,
+		isGameActive,
+		emergencyCooldownEndMs,
+		config: gameConfig,
+		sabotageEndMs,
+		sabotageChargesRemaining,
+		players: getConnectedPlayers()
+	};
+}
+
+function sendPlayerSnapshot(socket, playerId) {
+	const info = authToPlayer[playerId];
+	if (info?.role) socket.emit('role', info.role);
+	if (info?.tasks) socket.emit('tasks', info.tasks);
+	socket.emit('tasks-completed', getCompletionMapForAuth(playerId));
+	socket.emit('sabotage-usage', { used: sabotageUsedAuths.has(playerId) });
+	if (isSabotageActive && sabotageEndMs > Date.now()) {
+		socket.emit('sabotage-started', { endMs: sabotageEndMs });
+	}
+	const tasks = Object.values(taskProgress);
+	socket.emit('progress', tasks.length ? tasks.filter(Boolean).length / tasks.length : 0);
+	if (impostorAuths.has(playerId)) {
+		impostorIds.add(socket.id);
+		const endMs = killCooldownEndMsByAuth[playerId] || 0;
+		killCooldownEndMsBySocketId[socket.id] = endMs;
+		socket.emit('kill-cooldown-updated', { endMs });
+	}
+}
+
+function persistState() {
+	const snapshot = {
+		version: 1,
+		gameConfig,
+		playerDirectory,
+		authToPlayer,
+		taskProgress,
+		isMeeting,
+		isGameActive,
+		emergencyCooldownEndMs,
+		lastMeetingType,
+		impostorAuths: Array.from(impostorAuths),
+		killCooldownEndMsByAuth,
+		deadAuths: Array.from(deadAuths),
+		isSabotageActive,
+		sabotageEndMs,
+		sabotageUsedAuths: Array.from(sabotageUsedAuths),
+		sabotageChargesRemaining
+	};
+	const temporaryFile = `${STATE_FILE}.tmp`;
+	try {
+		fs.mkdirSync(DATA_DIR, { recursive: true });
+		fs.writeFileSync(temporaryFile, JSON.stringify(snapshot), 'utf8');
+		fs.renameSync(temporaryFile, STATE_FILE);
+		return true;
+	} catch (error) {
+		console.error('[persistence] Unable to save game state:', error);
+		try {
+			if (fs.existsSync(temporaryFile)) fs.unlinkSync(temporaryFile);
+		} catch (cleanupError) {
+			console.error('[persistence] Unable to remove incomplete state file:', cleanupError);
+		}
+		return false;
+	}
+}
+
+function loadPersistentState() {
+	try {
+		let savedFile;
+		try {
+			savedFile = fs.readFileSync(STATE_FILE, 'utf8');
+		} catch (error) {
+			if (error.code === 'ENOENT') return;
+			throw error;
+		}
+		const saved = JSON.parse(savedFile);
+		if (!isRecord(saved) || saved.version !== 1) {
+			throw new Error('Unsupported or invalid saved-state format');
+		}
+		const recordFields = ['gameConfig', 'playerDirectory', 'authToPlayer', 'taskProgress', 'killCooldownEndMsByAuth'];
+		if (recordFields.some(field => !isRecord(saved[field])) ||
+			!Array.isArray(saved.impostorAuths) ||
+			!Array.isArray(saved.deadAuths) ||
+			!Array.isArray(saved.sabotageUsedAuths) ||
+			!Array.isArray(saved.gameConfig.tasks) ||
+			!saved.gameConfig.tasks.every(task => typeof task === 'string') ||
+			!Object.entries(saved.playerDirectory).every(([id, player]) =>
+				isRecord(player) && player.id === id && typeof player.name === 'string' && player.name.trim()
+			) ||
+			!Object.values(saved.taskProgress).every(value => typeof value === 'boolean') ||
+			saved.impostorAuths.concat(saved.deadAuths, saved.sabotageUsedAuths).some(value => typeof value !== 'string')) {
+			throw new Error('Saved state contains invalid player or game data');
+		}
+		const numericConfigKeys = [
+			'numImpostors',
+			'numTasksPerPlayer',
+			'emergencyCooldownMinutes',
+			'killCooldownSeconds',
+			'maxPlayersPerTask',
+			'sabotageDurationSeconds',
+			'sabotageCharges'
+		];
+		if (numericConfigKeys.some(key => !Number.isFinite(saved.gameConfig[key]) || saved.gameConfig[key] < 0) ||
+			!Number.isFinite(saved.emergencyCooldownEndMs) ||
+			!Number.isFinite(saved.sabotageEndMs) ||
+			!Number.isFinite(saved.sabotageChargesRemaining) ||
+			!Object.values(saved.killCooldownEndMsByAuth).every(Number.isFinite) ||
+			!Object.values(saved.authToPlayer).every(player =>
+				isRecord(player) && typeof player.role === 'string' && isRecord(player.tasks)
+			)) {
+			throw new Error('Saved state contains invalid game settings');
+		}
+
+		if (saved.gameConfig && typeof saved.gameConfig === 'object') {
+			gameConfig = { ...gameConfig, ...saved.gameConfig };
+			if (!Array.isArray(gameConfig.tasks)) gameConfig.tasks = TASKS;
+		}
+		playerDirectory = Object.assign(Object.create(null), saved.playerDirectory);
+		authToPlayer = Object.assign(Object.create(null), saved.authToPlayer);
+		if (saved.taskProgress && typeof saved.taskProgress === 'object') {
+			taskProgress = Object.assign(Object.create(null), saved.taskProgress);
+		}
+		isMeeting = saved.isMeeting === true;
+		isGameActive = saved.isGameActive === true;
+		emergencyCooldownEndMs = Number(saved.emergencyCooldownEndMs) || 0;
+		lastMeetingType = saved.lastMeetingType || null;
+		impostorAuths = new Set(Array.isArray(saved.impostorAuths) ? saved.impostorAuths : []);
+		killCooldownEndMsByAuth = Object.assign(Object.create(null), saved.killCooldownEndMsByAuth);
+		deadAuths = new Set(Array.isArray(saved.deadAuths) ? saved.deadAuths : []);
+		isSabotageActive = saved.isSabotageActive === true && Number(saved.sabotageEndMs) > Date.now();
+		sabotageEndMs = isSabotageActive ? Number(saved.sabotageEndMs) : 0;
+		sabotageUsedAuths = new Set(Array.isArray(saved.sabotageUsedAuths) ? saved.sabotageUsedAuths : []);
+		sabotageChargesRemaining = Math.max(0, Number(saved.sabotageChargesRemaining) || 0);
+		if (isSabotageActive) {
+			sabotageTimeout = setTimeout(() => {
+				isSabotageActive = false;
+				sabotageEndMs = 0;
+				io.emit('sabotage-ended');
+				sabotageTimeout = null;
+				persistState();
+			}, Math.max(0, sabotageEndMs - Date.now()));
+		}
+		console.log('[persistence] Restored saved player and game state');
+	} catch (error) {
+		console.error('[persistence] Unable to load saved game state; starting with defaults:', error);
+	}
+}
+
+function isRecord(value) {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
 
 function emitTaskProgress() {
 	const tasks = Object.values(taskProgress);
 	const completed = tasks.filter(task => task).length;
-	const total = completed / tasks.length;
+	const total = tasks.length ? completed / tasks.length : 0;
 	io.emit('progress', total);
 	console.log('[progress]', { completed, totalTasks: tasks.length, ratio: total });
 
-	if (total === 1) {
+	if (tasks.length > 0 && total === 1) {
 		io.emit('play-win');
 	}
 }
@@ -554,6 +757,44 @@ function getCompletionMapForAuth(a) {
 		result[taskId] = !!taskProgress[taskId];
 	}
 	return result;
+}
+
+// NEW: Helper functions for player tracking
+function getConnectedPlayers() {
+	const connectedPlayerIds = new Set();
+	for (const socket of io.of('/').sockets.values()) {
+		if (socket.data.playerId) connectedPlayerIds.add(socket.data.playerId);
+	}
+	return Object.values(playerDirectory)
+		.map(player => ({
+			id: player.id,
+			name: player.name,
+			connected: connectedPlayerIds.has(player.id),
+			alive: !deadAuths.has(player.id)
+		}))
+		.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function broadcastPlayersToAdmins() {
+	const players = getConnectedPlayers();
+	for (const socket of io.of('/').sockets.values()) {
+		if (socket.handshake.query.role === 'ADMIN') {
+			socket.emit('players-updated', players);
+		}
+	}
+}
+
+function broadcastAliveCount() {
+	const aliveCount = Object.keys(authToPlayer)
+		.filter(playerId => !deadAuths.has(playerId)).length;
+
+	for (const [id, socket] of io.of('/').sockets) {
+		if (socket.data.playerId && impostorIds.has(id)) {
+			socket.emit('alive-count', { count: aliveCount });
+		}
+	}
+
+	console.log('[alive-count]', { count: aliveCount });
 }
 
 server.listen(PORT, () => console.log(`Server listening on *:${PORT}`));

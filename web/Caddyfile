@@ -1,0 +1,24 @@
+:80 {
+    # Use a named matcher to group the paths.
+    @api {
+        path /images/*
+        path /socket.io/*
+        path /sounds/*
+    }
+
+    # Use the named matcher in the route directive.
+    route @api {
+        # This 'handle' block passes the request to the proxy
+        # without stripping the prefix.
+        handle {
+            reverse_proxy backend:4046
+        }
+    }
+
+    # This 'handle' block acts as a catch-all for all other requests.
+    handle {
+        root * /srv
+        try_files {path} {path}/ /index.html
+        file_server
+    }
+}

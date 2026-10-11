@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { Alert, Backdrop, Box, Card, CardContent, Checkbox, FormControlLabel, LinearProgress, List, ListItem, ListItemText, Stack, Typography, Dialog, DialogContent, IconButton, Tooltip, Button } from '@mui/material';
+import { Alert, Backdrop, Box, Button, Card, CardContent, Checkbox, FormControlLabel, IconButton, LinearProgress, List, ListItem, ListItemText, Stack, TextField, Tooltip, Typography, Dialog, DialogContent } from '@mui/material';
 import MapIcon from '@mui/icons-material/Map';
 
 export default function Player() {
@@ -9,8 +9,20 @@ export default function Player() {
   const [progress, setProgress] = useState(0);
   const [role, setRole] = useState('');
   const [authId, setAuthId] = useState('');
+  const [playerName, setPlayerName] = useState(() => {
+    try {
+      return localStorage.getItem('playerName') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [nameInput, setNameInput] = useState(playerName);
+  const [loginAttempt, setLoginAttempt] = useState(0);
+  const [loginError, setLoginError] = useState('');
+  const [isConnected, setIsConnected] = useState(false);
   const audioRef = useRef(null);
   const socketRef = useRef(null);
+  const playerActionsRef = useRef({});
   const [meeting, setMeeting] = useState(false);
   const [gameActive, setGameActive] = useState(false);
   const [isImpostor, setIsImpostor] = useState(false);
@@ -26,72 +38,101 @@ export default function Player() {
   const swLastTickRef = useRef(0);
 
   useEffect(() => {
-    // Generate or load a per-tab auth token (so multiple tabs == multiple players)
-    const params = new URLSearchParams(window.location.search);
-    const forceNew = params.get('forceNewAuth') === '1';
-    const urlAuth = params.get('auth');
-    let auth = (!forceNew && sessionStorage.getItem('auth')) || urlAuth || '';
-    if (!auth) {
-      auth = Math.random().toString(36).slice(2) + Date.now().toString(36);
-      sessionStorage.setItem('auth', auth);
-    } else if (forceNew) {
-      auth = Math.random().toString(36).slice(2) + Date.now().toString(36);
-      sessionStorage.setItem('auth', auth);
-    } else if (!sessionStorage.getItem('auth')) {
-      sessionStorage.setItem('auth', auth);
-    }
-    const socket = io({ query: { role: 'PLAYER', auth } });
-    console.log('[client] connect with auth', auth);
-    setAuthId(auth);
+    if (!playerName) return;
+    const socket = io({ query: { role: 'PLAYER' } });
     socketRef.current = socket;
 
-    socket.on('tasks', (t) => { console.log('[client] tasks', t && Object.keys(t).length); setTasks(t || {}); });
-    socket.on('progress', (p) => { console.log('[client] progress', p); setProgress(p || 0); });
-    socket.on('tasks-completed', (m) => { console.log('[client] tasks-completed', m); setCompleted(m || {}); });
-    socket.on('role', (r) => { console.log('[client] role', r); setRole(r || ''); setIsImpostor(r === 'Impostor'); });
-    socket.on('play-meeting', async () => {
-      await playSound('/sounds/meeting.mp3');
-      await waitMs(2000);
-      await playSound('/sounds/sussy-boy.mp3');
+    socket.on('connect', () => {
+      setIsConnected(false);
+      socket.timeout(10000).emit('player-login', { name: playerName }, (timeoutError, response) => {
+        if (timeoutError || !response?.ok) {
+          const messages = {
+            'invalid-name': 'Enter a name between 1 and 32 characters.',
+            'name-in-use': 'That name is already connected. Choose a different name.',
+            'persistence-unavailable': 'The server could not save your player profile. Please try again later.'
+          };
+          setLoginError(messages[response?.reason] || 'Could not connect to the game. Please try again.');
+          socket.disconnect();
+          return;
+        }
+        setLoginError('');
+        setAuthId(response.id);
+        setIsConnected(true);
+        try {
+          localStorage.setItem('playerName', response.name);
+        } catch {
+          console.warn('Could not save the player name in browser storage.');
+        }
+      });
     });
-    socket.on('meeting-started', () => { console.log('[client] meeting-started'); setMeeting(true); });
-    socket.on('meeting-ended', () => { console.log('[client] meeting-ended'); setMeeting(false); });
-    socket.on('game-started', () => { console.log('[client] game-started'); stopAllSounds(); setGameActive(true); });
-    socket.on('game-ended', () => { console.log('[client] game-ended'); stopAllSounds(); setGameActive(false); setMeeting(false); setTasks({}); setProgress(0); });
-    socket.on('state', (s) => { console.log('[client] state', s); setMeeting(!!s?.isMeeting); setGameActive(!!s?.isGameActive); if (typeof s?.sabotageChargesRemaining === 'number') setSabotageChargesRemaining(s.sabotageChargesRemaining); });
+    socket.on('disconnect', () => setIsConnected(false));
+
+    socket.on('tasks', (t) => { setTasks(t || {}); });
+    socket.on('progress', (p) => { setProgress(p || 0); });
+    socket.on('tasks-completed', (m) => { setCompleted(m || {}); });
+    socket.on('role', (r) => { setRole(r || ''); setIsImpostor(r === 'Impostor'); });
+    socket.on('play-meeting', async () => {
+      await playerActionsRef.current.playSound('/sounds/meeting.mp3');
+      await waitMs(2000);
+      await playerActionsRef.current.playSound('/sounds/sussy-boy.mp3');
+    });
+    socket.on('meeting-started', () => setMeeting(true));
+    socket.on('meeting-ended', () => setMeeting(false));
+    socket.on('game-started', () => {
+      playerActionsRef.current.stopAllSounds();
+      setHasUsedSabotage(false);
+      setSabotageEndMs(0);
+      setGameActive(true);
+    });
+    socket.on('game-ended', () => {
+      playerActionsRef.current.stopAllSounds();
+      setHasUsedSabotage(false);
+      setSabotageEndMs(0);
+      setSabotageChargesRemaining(0);
+      setGameActive(false);
+      setMeeting(false);
+      setTasks({});
+      setProgress(0);
+    });
+    socket.on('state', (s) => { setMeeting(!!s?.isMeeting); setGameActive(!!s?.isGameActive); if (typeof s?.sabotageChargesRemaining === 'number') setSabotageChargesRemaining(s.sabotageChargesRemaining); });
     socket.on('sabotage-started', ({ endMs }) => {
-      console.log('[client] sabotage-started', endMs);
       setSabotageEndMs(endMs || 0);
-      playLoop('/sounds/sabotage.mp3', endMs);
+      playerActionsRef.current.playLoop('/sounds/sabotage.mp3', endMs);
     });
     socket.on('sabotage-ended', () => {
-      console.log('[client] sabotage-ended');
       setSabotageEndMs(0);
-      stopLoop();
+      playerActionsRef.current.stopLoop();
     });
     socket.on('sabotage-charges', ({ remaining }) => {
       setSabotageChargesRemaining(remaining || 0);
     });
     socket.on('sabotage-usage', ({ used }) => {
-      // Could disable button client-side; we'll compute from this
-      if (used) setHasUsedSabotage(true);
+      setHasUsedSabotage(!!used);
     });
     socket.on('kill-cooldown-updated', ({ endMs }) => {
       const remaining = endMs - Date.now();
       setKillCooldownRemainingMs(Math.max(0, remaining));
     });
     socket.on('play-win', async () => {
-      await playSound('/sounds/you-win.mp3');
+      await playerActionsRef.current.playSound('/sounds/you-win.mp3');
     });
-
-    // Ask server to rehydrate our identity/tasks if available
-    console.log('[client] whoami', auth);
-    socket.emit('whoami', { auth });
 
     return () => {
       socket.disconnect();
     };
-  }, []);
+  }, [playerName, loginAttempt]);
+
+  function loginWithName(event) {
+    event.preventDefault();
+    const name = nameInput.trim();
+    if (!name) {
+      setLoginError('Enter your name to join.');
+      return;
+    }
+    setLoginError('');
+    setPlayerName(name);
+    setLoginAttempt((attempt) => attempt + 1);
+  }
 
   function toggleTask(taskId, checked) {
     const socket = socketRef.current;
@@ -102,10 +143,12 @@ export default function Player() {
         const next = { ...prev, [taskId]: !!checked };
         try {
           const key = `imp_completed_${authId || 'unknown'}`;
-          const current = JSON.parse(sessionStorage.getItem(key) || '{}');
+          const current = JSON.parse(localStorage.getItem(key) || '{}');
           current[taskId] = !!checked;
-          sessionStorage.setItem(key, JSON.stringify(current));
-        } catch (_) {}
+          localStorage.setItem(key, JSON.stringify(current));
+        } catch (error) {
+          console.warn('Could not persist impostor task progress.', error);
+        }
         return next;
       });
       return;
@@ -124,13 +167,15 @@ export default function Player() {
     if (!audioReady) {
       try {
         await enableAudio();
-      } catch (_) {}
+      } catch (error) {
+        console.warn('Audio could not be unlocked yet.', error);
+      }
     }
     el.src = url;
     try {
       await el.play();
-    } catch (_) {
-      // Ignore; mobile may still block
+    } catch (error) {
+      console.warn('Audio playback was blocked by the browser.', error);
     }
   }
 
@@ -141,26 +186,34 @@ export default function Player() {
     const el = audioRef.current;
     if (!el) return;
     if (!audioReady) {
-      try { await enableAudio(); } catch (_) {}
+      try {
+        await enableAudio();
+      } catch (error) {
+        console.warn('Could not unlock audio for the sabotage alarm.', error);
+      }
     }
     const tick = async () => {
       if (Date.now() >= (endMs || 0)) { stopLoop(); return; }
       try {
         el.src = url;
         await el.play();
-      } catch (_) {}
+      } catch (error) {
+        console.warn('Sabotage alarm playback failed.', error);
+      }
       loopRef.current = setTimeout(tick, (el.duration && !isNaN(el.duration) ? el.duration * 1000 : 1500));
     };
     tick();
   }
   function stopLoop() {
     if (loopRef.current) { clearTimeout(loopRef.current); loopRef.current = null; }
-    try { const el = audioRef.current; if (el) { el.pause(); el.currentTime = 0; } } catch (_) {}
+    const el = audioRef.current;
+    if (el) { el.pause(); el.currentTime = 0; }
   }
 
   function stopAllSounds() {
-    try { stopLoop(); } catch (_) {}
-    try { const el = audioRef.current; if (el) { el.pause(); el.currentTime = 0; } } catch (_) {}
+    stopLoop();
+    const el = audioRef.current;
+    if (el) { el.pause(); el.currentTime = 0; }
   }
 
   async function enableAudio() {
@@ -176,8 +229,8 @@ export default function Player() {
       el.currentTime = 0;
       el.muted = false;
       setAudioReady(true);
-    } catch (_) {
-      // Some devices require explicit user action; a tap handler below retries
+    } catch (error) {
+      console.warn('Audio remains locked; tap the screen to enable playback.', error);
     }
   }
 
@@ -219,13 +272,17 @@ export default function Player() {
     if (!authId || !isImpostor) return;
     try {
       const key = `imp_completed_${authId}`;
-      const stored = JSON.parse(sessionStorage.getItem(key) || '{}');
-      const merged = { ...completed };
-      for (const tid of Object.keys(tasks || {})) {
-        if (typeof stored[tid] === 'boolean') merged[tid] = stored[tid];
-      }
-      setCompleted(merged);
-    } catch (_) {}
+      const stored = JSON.parse(localStorage.getItem(key) || '{}');
+      setCompleted((previous) => {
+        const merged = { ...previous };
+        for (const tid of Object.keys(tasks || {})) {
+          if (typeof stored[tid] === 'boolean') merged[tid] = stored[tid];
+        }
+        return merged;
+      });
+    } catch (error) {
+      console.warn('Could not restore impostor task progress.', error);
+    }
   }, [authId, isImpostor, tasks]);
 
   // Stopwatch ticker
@@ -257,13 +314,42 @@ export default function Player() {
     return `${mm}:${ss}`;
   }
 
+  playerActionsRef.current = { playLoop, playSound, stopAllSounds, stopLoop };
+
   const hasTasks = Object.keys(tasks).length > 0;
   const [hasUsedSabotage, setHasUsedSabotage] = useState(false);
+
+  if (!playerName || loginError) {
+    return (
+      <Stack component="form" spacing={2} alignItems="center" onSubmit={loginWithName} sx={{ width: '100%', py: 3 }}>
+        <Card sx={{ width: '100%', maxWidth: 420 }}>
+          <CardContent>
+            <Stack spacing={2}>
+              <Typography variant="h5" align="center">Join the game</Typography>
+              <Typography align="center">Enter your name so the admin can see when you are connected.</Typography>
+              {loginError && <Alert severity="error">{loginError}</Alert>}
+              <TextField
+                autoFocus
+                label="Your name"
+                value={nameInput}
+                onChange={(event) => setNameInput(event.target.value)}
+                inputProps={{ maxLength: 32 }}
+                required
+                fullWidth
+              />
+              <Button type="submit" variant="contained">Connect</Button>
+            </Stack>
+          </CardContent>
+        </Card>
+      </Stack>
+    );
+  }
 
   if (!gameActive) {
     return (
       <Stack spacing={2} alignItems="center" sx={{ width: '100%' }}>
-        <Typography variant="overline">Player ({authId || '...'})</Typography>
+        <Typography variant="overline">Player ({playerName})</Typography>
+        {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
         <Card sx={{ width: '100%', maxWidth: 420 }}>
           <CardContent>
             <Typography variant="h5" align="center">GAME NOT STARTED</Typography>
@@ -286,7 +372,8 @@ export default function Player() {
   if (gameActive && !hasTasks) {
     return (
       <Stack spacing={2} alignItems="center" sx={{ width: '100%' }}>
-        <Typography variant="overline">Player ({authId || '...'})</Typography>
+        <Typography variant="overline">Player ({playerName})</Typography>
+        {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
         <Card sx={{ width: '100%', maxWidth: 420 }}>
           <CardContent>
             <Typography variant="h5" align="center">A GAME IS IN PROGRESS</Typography>
@@ -299,7 +386,8 @@ export default function Player() {
 
   return (
     <Stack spacing={2} alignItems="center" sx={{ width: '100%' }}>
-      <Typography variant="overline">Player ({authId || '...'})</Typography>
+      <Typography variant="overline">Player ({playerName})</Typography>
+      {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
       {/* Stopwatch */}
       <Stack spacing={1} direction="row" alignItems="center">
         <Typography variant="h6" sx={{ minWidth: 72, textAlign: 'center' }}>{formatTime(stopwatchMs)}</Typography>
@@ -327,7 +415,7 @@ export default function Player() {
 
       {isImpostor && (
         <Stack spacing={1} alignItems="center">
-          <Button variant="contained" color="error" disabled={!gameActive || meeting || sabotageChargesRemaining <= 0} onClick={() => socketRef.current?.emit('sabotage')}>
+          <Button variant="contained" color="error" disabled={!gameActive || meeting || isSabotageActive || hasUsedSabotage || sabotageChargesRemaining <= 0} onClick={() => socketRef.current?.emit('sabotage')}>
             Sabotage
           </Button>
           <Typography variant="caption" color={sabotageChargesRemaining > 0 ? 'text.secondary' : 'error'}>
@@ -381,5 +469,3 @@ export default function Player() {
     </Stack>
   );
 }
-
-
