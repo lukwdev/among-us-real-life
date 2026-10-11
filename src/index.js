@@ -9,6 +9,10 @@ const _ = require('lodash');
 const path = require('path');
 const { Server } = require('socket.io');
 const webPush = require('web-push');
+const { createCollectionMapRouter } = require('./collection-map-router');
+const { createGameProgress } = require('./game-progress');
+const { createJsonStore } = require('./json-store');
+const { createMeetingNotifier } = require('./push-notifications');
 
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
@@ -124,97 +128,45 @@ let sabotageChargesRemaining = 0;
 let deadAuths = new Set();
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const STATE_FILE = path.join(DATA_DIR, 'game-state.json');
+const stateStore = createJsonStore(STATE_FILE);
 let playerDirectory = Object.create(null);
 let pushSubscriptions = Object.create(null);
 let adminSessions = Object.create(null);
 let collectionMaps = Object.create(null);
 const ADMIN_SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+const { emitTaskProgress, getGlobalProgress } = createGameProgress({
+	io,
+	getTaskProgress: () => taskProgress
+});
+const notifyMeetingPlayers = createMeetingNotifier({
+	webPush,
+	isEnabled: pushEnabled,
+	getSubscriptions: () => pushSubscriptions,
+	removeSubscription: (playerId, subscriptionId) => {
+		const subscriptions = pushSubscriptions[playerId];
+		if (!subscriptions) return;
+		delete subscriptions[subscriptionId];
+		if (Object.keys(subscriptions).length === 0) delete pushSubscriptions[playerId];
+	},
+	persistState: () => persistState()
+});
 
 loadPersistentState();
 
 app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
-app.get('/api/maps/:collectionId', (req, res) => {
-	const map = collectionMaps[req.params.collectionId];
-	if (!map) return res.sendStatus(404);
-	const mapPath = path.join(DATA_DIR, 'maps', map.filename);
-	if (!fs.existsSync(mapPath)) return res.sendStatus(404);
-	res.set({
-		'Cache-Control': 'no-store',
-		'Content-Type': map.mimeType,
-		'X-Content-Type-Options': 'nosniff'
-	});
-	res.sendFile(mapPath, error => {
-		if (error && !res.headersSent) {
-			console.error('[maps] Unable to serve collection map:', error);
-			res.sendStatus(500);
-		}
-	});
-});
-app.post('/api/admin/collections/:collectionId/map', express.raw({
-	type: ['image/jpeg', 'image/png', 'image/webp'],
-	limit: '10mb'
-}), (req, res) => {
-	if (!isValidAdminSessionToken(req.get('authorization'))) {
-		return res.status(401).json({ ok: false, error: 'unauthorized' });
-	}
-	const collectionId = req.params.collectionId;
-	if (!taskCollections.some(collection => collection.id === collectionId)) {
-		return res.status(404).json({ ok: false, error: 'collection-not-found' });
-	}
-	const image = getSupportedImage(req.body, req.get('content-type'));
-	if (!image) return res.status(415).json({ ok: false, error: 'unsupported-image' });
-
-	const filename = `${crypto.randomBytes(16).toString('hex')}.${image.extension}`;
-	const mapsDirectory = path.join(DATA_DIR, 'maps');
-	const temporaryPath = path.join(mapsDirectory, `${filename}.tmp`);
-	const finalPath = path.join(mapsDirectory, filename);
-	const previousMap = collectionMaps[collectionId];
-	try {
-		fs.mkdirSync(mapsDirectory, { recursive: true, mode: 0o700 });
-		fs.writeFileSync(temporaryPath, image.bytes, { mode: 0o600, flag: 'wx' });
-		fs.renameSync(temporaryPath, finalPath);
-		collectionMaps[collectionId] = { filename, mimeType: image.mimeType };
-		if (!persistState()) {
-			if (previousMap) collectionMaps[collectionId] = previousMap;
-			else delete collectionMaps[collectionId];
-			fs.unlinkSync(finalPath);
-			return res.status(500).json({ ok: false, error: 'persistence-unavailable' });
-		}
-		if (previousMap) removeCollectionMapFile(previousMap);
-		broadcastAdminState();
-		res.json({ ok: true, mapUrl: getCollectionMapUrl(collectionId) });
-	} catch (error) {
-		if (collectionMaps[collectionId]?.filename === filename) {
-			if (previousMap) collectionMaps[collectionId] = previousMap;
-			else delete collectionMaps[collectionId];
-		}
-		for (const filePath of [temporaryPath, finalPath]) {
-			try {
-				if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-			} catch (cleanupError) {
-				console.error('[maps] Unable to clean up uploaded map:', cleanupError);
-			}
-		}
-		console.error('[maps] Unable to store collection map:', error);
-		if (!res.headersSent) res.status(500).json({ ok: false, error: 'persistence-unavailable' });
-	}
-});
-app.delete('/api/admin/collections/:collectionId/map', (req, res) => {
-	if (!isValidAdminSessionToken(req.get('authorization'))) {
-		return res.status(401).json({ ok: false, error: 'unauthorized' });
-	}
-	const collectionId = req.params.collectionId;
-	const previousMap = collectionMaps[collectionId];
-	if (!previousMap) return res.status(404).json({ ok: false, error: 'map-not-found' });
-	delete collectionMaps[collectionId];
-	if (!persistState()) {
-		collectionMaps[collectionId] = previousMap;
-		return res.status(500).json({ ok: false, error: 'persistence-unavailable' });
-	}
-	removeCollectionMapFile(previousMap);
-	broadcastAdminState();
-	res.json({ ok: true });
-});
+app.use('/api', createCollectionMapRouter({
+	express,
+	dataDir: DATA_DIR,
+	isAdminSessionToken: authorization => isValidAdminSessionToken(authorization),
+	hasCollection: collectionId => taskCollections.some(collection => collection.id === collectionId),
+	getCollectionMap: collectionId => collectionMaps[collectionId],
+	setCollectionMap: (collectionId, map) => { collectionMaps[collectionId] = map; },
+	deleteCollectionMap: collectionId => { delete collectionMaps[collectionId]; },
+	persistState,
+	getCollectionMapUrl,
+	removeCollectionMapFile,
+	onChange: broadcastAdminState
+}));
 if (process.env.NODE_ENV === 'production') {
 	const clientBuildPath = path.join(__dirname, '..', 'web', 'dist');
 	app.use(express.static(clientBuildPath));
@@ -875,10 +827,11 @@ io.on('connection', socket => {
 
 	socket.on('task-complete', taskId => {
 		if (!socket.data.playerId || isMeeting || !isGameActive) return;
+		const isNewlyCompleted = taskProgress[taskId] === false;
 		if (typeof taskProgress[taskId] === 'boolean') {
 			taskProgress[taskId] = true;
 		}
-		emitTaskProgress();
+		emitTaskProgress({ announceWin: isNewlyCompleted });
 		console.log('[task-complete]', { socketId: socket.id, auth: socketIdToAuth[socket.id], taskId });
 		const a = socketIdToAuth[socket.id];
 		if (a) {
@@ -989,33 +942,13 @@ function persistState() {
 		sabotageUsedAuths: Array.from(sabotageUsedAuths),
 		sabotageChargesRemaining
 	};
-	const temporaryFile = `${STATE_FILE}.tmp`;
-	try {
-		fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-		fs.writeFileSync(temporaryFile, JSON.stringify(snapshot), { encoding: 'utf8', mode: 0o600 });
-		fs.renameSync(temporaryFile, STATE_FILE);
-		return true;
-	} catch (error) {
-		console.error('[persistence] Unable to save game state:', error);
-		try {
-			if (fs.existsSync(temporaryFile)) fs.unlinkSync(temporaryFile);
-		} catch (cleanupError) {
-			console.error('[persistence] Unable to remove incomplete state file:', cleanupError);
-		}
-		return false;
-	}
+	return stateStore.write(snapshot);
 }
 
 function loadPersistentState() {
 	try {
-		let savedFile;
-		try {
-			savedFile = fs.readFileSync(STATE_FILE, 'utf8');
-		} catch (error) {
-			if (error.code === 'ENOENT') return;
-			throw error;
-		}
-		const saved = JSON.parse(savedFile);
+		const saved = stateStore.read();
+		if (saved === null) return;
 		if (!isRecord(saved) || saved.version !== 1) {
 			throw new Error('Unsupported or invalid saved-state format');
 		}
@@ -1167,26 +1100,6 @@ function isAuthenticatedAdmin(socket) {
 		adminSessions[sessionHash] > Date.now();
 }
 
-function getSupportedImage(body, contentType) {
-	if (!Buffer.isBuffer(body) || body.length === 0) return null;
-	if (contentType === 'image/jpeg' &&
-		body[0] === 0xff && body[1] === 0xd8 && body[2] === 0xff) {
-		return { bytes: body, extension: 'jpg', mimeType: contentType };
-	}
-	if (contentType === 'image/png' &&
-		body.length >= 8 &&
-		body.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
-		return { bytes: body, extension: 'png', mimeType: contentType };
-	}
-	if (contentType === 'image/webp' &&
-		body.length >= 12 &&
-		body.toString('ascii', 0, 4) === 'RIFF' &&
-		body.toString('ascii', 8, 12) === 'WEBP') {
-		return { bytes: body, extension: 'webp', mimeType: contentType };
-	}
-	return null;
-}
-
 function removeCollectionMapFile(map) {
 	if (!map || !/^[a-f0-9]{32}\.(jpg|png|webp)$/.test(map.filename)) return;
 	const mapPath = path.join(DATA_DIR, 'maps', map.filename);
@@ -1246,49 +1159,6 @@ function isValidPushSubscription(subscription) {
 		return new URL(subscription.endpoint).protocol === 'https:';
 	} catch {
 		return false;
-	}
-}
-
-async function notifyMeetingPlayers(title, body) {
-	if (!pushEnabled) return;
-	const notification = JSON.stringify({ title, body, url: '/' });
-	for (const [playerId, subscriptions] of Object.entries(pushSubscriptions)) {
-		for (const [subscriptionId, subscription] of Object.entries(subscriptions)) {
-			try {
-				await webPush.sendNotification(subscription, notification, { TTL: 120, urgency: 'high' });
-			} catch (error) {
-				if (error.statusCode === 404 || error.statusCode === 410) {
-					delete pushSubscriptions[playerId][subscriptionId];
-					if (Object.keys(pushSubscriptions[playerId]).length === 0) {
-						delete pushSubscriptions[playerId];
-					}
-					persistState();
-				} else {
-					console.error('[push] Unable to send meeting notification:', error);
-				}
-			}
-		}
-	}
-}
-
-function emitTaskProgress() {
-	const progress = getGlobalProgress();
-	io.emit('progress', progress.ratio);
-	io.emit('global-progress', progress);
-	console.log('[progress]', progress);
-}
-
-function getGlobalProgress() {
-	const tasks = Object.values(taskProgress);
-	const completed = tasks.filter(Boolean).length;
-	return {
-		completed,
-		total: tasks.length,
-		ratio: tasks.length ? completed / tasks.length : 0
-	};
-
-	if (tasks.length > 0 && total === 1) {
-		io.emit('play-win');
 	}
 }
 

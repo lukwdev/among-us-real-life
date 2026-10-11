@@ -20,17 +20,9 @@ This was built for personal use, but anyone is welcome to use this for hosting t
 
 ### 1. Configure the game
 
-You may want to modify the following properties located in [`src/index.js`](https://github.com/michaelgira23/among-us-real-life/blob/master/src/index.js):
+Manage game settings and task collections from the admin dashboard. Each collection can be used for a different location; task labels are assigned without duplicates for an individual player, and the per-task player cap is respected when the task pool allows it.
 
-[`TASKS`](https://github.com/michaelgira23/among-us-real-life/blob/master/src/index.js#L14) - An array of strings that consist of all possible tasks. These will be randomly assigned to players.
-
-[`N_TASKS`](https://github.com/michaelgira23/among-us-real-life/blob/master/src/index.js#L31) - Default number of tasks to assign each player
-
-[`N_IMPOSTORS`](https://github.com/michaelgira23/among-us-real-life/blob/master/src/index.js#L32) - Number of impostors to assign each round
-
-You can also change the task count from the admin dashboard before starting a round. The assignment logic now keeps every player’s task list unique and prevents one task label from exceeding the configured per-task cap.
-
-Task collections are managed in the admin dashboard. Create a collection for each game location, add or remove tasks, and save it; the selected collection is used when the next game starts. Each collection can also have its own JPG, PNG, or WebP map (up to 10 MB), saved alongside persistent server data and shown to players during that collection's game. The admin dashboard shows global task completion across all players.
+Each collection can also have its own JPG, PNG, or WebP map (up to 10 MB), saved alongside persistent server data and shown to players during that collection's game. The admin dashboard shows global task completion across all players.
 
 Players join by entering a name. Names are case-insensitive and must be unique while connected; the admin dashboard shows all players who have logged in and whether each is currently connected. Admins can remove saved players from the roster when a game is not active; removing a connected player also disconnects them. The roster, game settings, roles, task progress, and active round are saved in `DATA_DIR` (defaults to `data/`) and restored after a backend restart. Keep this directory on persistent storage when deploying; the provided Compose configuration mounts a named volume for it.
 
@@ -53,9 +45,17 @@ docker compose logs -f
 
 The app listens on `127.0.0.1:8080` by default. Point your existing reverse proxy at that address, terminate TLS there, and enable WebSocket upgrades for `/socket.io/`. The browser-facing site must use HTTPS for push notifications and is strongly recommended for normal use. If the reverse proxy is in another container, set `APP_BIND_ADDRESS=0.0.0.0` or attach it to the Compose network and proxy to the `frontend` service. Optionally set `CORS_ORIGIN` to your public origin (for example, `https://among.example.com`).
 
-Back up the `game-data` Docker volume. A container restart preserves it; deleting the volume does not. Do not run multiple backend replicas with this file-based storage, because each replica would have independent state.
+Back up the `game-data` Docker volume, which contains both `game-state.json` and uploaded collection maps. A container restart preserves it; deleting the volume does not. To restore, stop the app, restore the volume backup, then start the app. Do not run multiple backend replicas with this file-based storage, because each replica would have independent state.
 
 Hosting platforms with ephemeral disks (including free Render services) will lose saved game state on redeploy or restart unless you attach persistent storage and set `DATA_DIR` to its mount path.
+
+### Backend structure
+
+- `src/index.js` wires configuration, HTTP, Socket.IO, and game lifecycle events.
+- `src/json-store.js` handles JSON reads and atomic writes for durable game state.
+- `src/collection-map-router.js` validates, persists, and serves collection map uploads.
+- `src/push-notifications.js` sends meeting alerts and prunes expired subscriptions.
+- `src/game-progress.js` calculates and broadcasts global task progress and the completion sound.
 
 ### 3. Run locally without Docker
 
@@ -82,7 +82,8 @@ Players open the site on their phones and sign in with their name. They can opt 
 
 The existing in-page sounds alone do not cover a screen that is locked or a browser suspended in the background. A service worker and Web Push can alert players in that situation once they have opted in, but a web app cannot guarantee delivery if notifications are blocked, the device is offline, or the OS suppresses them.
 
-## Known issues
+## Operational limits
 
--   Sometimes, duplicate tasks are assigned (temporary workaround is to start another game)
--   On some Android phones, hiding the browser will reset its state, therefore losing your tasks
+- Persistent state is stored in a single JSON file and supports one backend instance only. Keep `DATA_DIR` on persistent storage and maintain external backups.
+- Browser and operating-system lifecycle behavior varies. Push alerts require HTTPS, user permission, and working browser/OS push support; delivery cannot be guaranteed when a device is offline or notifications are suppressed.
+- Run `npm test` to execute the backend unit tests and `npm run lint --prefix web` to check the frontend.
