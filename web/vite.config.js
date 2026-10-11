@@ -13,12 +13,7 @@ export default defineConfig({
 				changeOrigin: true,
 				ws: true
 			},
-			// Proxy static assets served by Express during dev
-			'/sounds': {
-				target: 'http://localhost:4046',
-				changeOrigin: true
-			},
-			'/images': {
+			'/api': {
 				target: 'http://localhost:4046',
 				changeOrigin: true
 			}

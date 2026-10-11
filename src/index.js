@@ -127,11 +127,94 @@ const STATE_FILE = path.join(DATA_DIR, 'game-state.json');
 let playerDirectory = Object.create(null);
 let pushSubscriptions = Object.create(null);
 let adminSessions = Object.create(null);
+let collectionMaps = Object.create(null);
 const ADMIN_SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 
 loadPersistentState();
 
 app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
+app.get('/api/maps/:collectionId', (req, res) => {
+	const map = collectionMaps[req.params.collectionId];
+	if (!map) return res.sendStatus(404);
+	const mapPath = path.join(DATA_DIR, 'maps', map.filename);
+	if (!fs.existsSync(mapPath)) return res.sendStatus(404);
+	res.set({
+		'Cache-Control': 'no-store',
+		'Content-Type': map.mimeType,
+		'X-Content-Type-Options': 'nosniff'
+	});
+	res.sendFile(mapPath, error => {
+		if (error && !res.headersSent) {
+			console.error('[maps] Unable to serve collection map:', error);
+			res.sendStatus(500);
+		}
+	});
+});
+app.post('/api/admin/collections/:collectionId/map', express.raw({
+	type: ['image/jpeg', 'image/png', 'image/webp'],
+	limit: '10mb'
+}), (req, res) => {
+	if (!isValidAdminSessionToken(req.get('authorization'))) {
+		return res.status(401).json({ ok: false, error: 'unauthorized' });
+	}
+	const collectionId = req.params.collectionId;
+	if (!taskCollections.some(collection => collection.id === collectionId)) {
+		return res.status(404).json({ ok: false, error: 'collection-not-found' });
+	}
+	const image = getSupportedImage(req.body, req.get('content-type'));
+	if (!image) return res.status(415).json({ ok: false, error: 'unsupported-image' });
+
+	const filename = `${crypto.randomBytes(16).toString('hex')}.${image.extension}`;
+	const mapsDirectory = path.join(DATA_DIR, 'maps');
+	const temporaryPath = path.join(mapsDirectory, `${filename}.tmp`);
+	const finalPath = path.join(mapsDirectory, filename);
+	const previousMap = collectionMaps[collectionId];
+	try {
+		fs.mkdirSync(mapsDirectory, { recursive: true, mode: 0o700 });
+		fs.writeFileSync(temporaryPath, image.bytes, { mode: 0o600, flag: 'wx' });
+		fs.renameSync(temporaryPath, finalPath);
+		collectionMaps[collectionId] = { filename, mimeType: image.mimeType };
+		if (!persistState()) {
+			if (previousMap) collectionMaps[collectionId] = previousMap;
+			else delete collectionMaps[collectionId];
+			fs.unlinkSync(finalPath);
+			return res.status(500).json({ ok: false, error: 'persistence-unavailable' });
+		}
+		if (previousMap) removeCollectionMapFile(previousMap);
+		broadcastAdminState();
+		res.json({ ok: true, mapUrl: getCollectionMapUrl(collectionId) });
+	} catch (error) {
+		if (collectionMaps[collectionId]?.filename === filename) {
+			if (previousMap) collectionMaps[collectionId] = previousMap;
+			else delete collectionMaps[collectionId];
+		}
+		for (const filePath of [temporaryPath, finalPath]) {
+			try {
+				if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+			} catch (cleanupError) {
+				console.error('[maps] Unable to clean up uploaded map:', cleanupError);
+			}
+		}
+		console.error('[maps] Unable to store collection map:', error);
+		if (!res.headersSent) res.status(500).json({ ok: false, error: 'persistence-unavailable' });
+	}
+});
+app.delete('/api/admin/collections/:collectionId/map', (req, res) => {
+	if (!isValidAdminSessionToken(req.get('authorization'))) {
+		return res.status(401).json({ ok: false, error: 'unauthorized' });
+	}
+	const collectionId = req.params.collectionId;
+	const previousMap = collectionMaps[collectionId];
+	if (!previousMap) return res.status(404).json({ ok: false, error: 'map-not-found' });
+	delete collectionMaps[collectionId];
+	if (!persistState()) {
+		collectionMaps[collectionId] = previousMap;
+		return res.status(500).json({ ok: false, error: 'persistence-unavailable' });
+	}
+	removeCollectionMapFile(previousMap);
+	broadcastAdminState();
+	res.json({ ok: true });
+});
 if (process.env.NODE_ENV === 'production') {
 	const clientBuildPath = path.join(__dirname, '..', 'web', 'dist');
 	app.use(express.static(clientBuildPath));
@@ -158,6 +241,7 @@ io.on('connection', socket => {
 	// Allow clients to request a fresh snapshot of state
 	socket.on('get-state', () => {
 		socket.emit('state', getStateSnapshot(isAuthenticatedAdmin(socket)));
+		if (isAuthenticatedAdmin(socket)) socket.emit('global-progress', getGlobalProgress());
 		console.log('[get-state]', { socketId: socket.id, auth: socketIdToAuth[socket.id], isMeeting, isGameActive, emergencyCooldownEndMs });
 	});
 
@@ -182,6 +266,7 @@ io.on('connection', socket => {
 			reply({ ok: true, sessionExpiresAt: expiresAt });
 			socket.emit('state', getStateSnapshot(true));
 			socket.emit('players-updated', getConnectedPlayers());
+			socket.emit('global-progress', getGlobalProgress());
 			return;
 		}
 
@@ -213,6 +298,7 @@ io.on('connection', socket => {
 		});
 		socket.emit('state', getStateSnapshot(true));
 		socket.emit('players-updated', getConnectedPlayers());
+		socket.emit('global-progress', getGlobalProgress());
 	});
 
 	socket.on('admin-logout', acknowledge => {
@@ -351,22 +437,32 @@ io.on('connection', socket => {
 		const previousCollections = taskCollections;
 		const previousSelectedCollectionId = selectedTaskCollectionId;
 		const previousConfiguredTasks = gameConfig.tasks;
+		const previousCollectionMaps = collectionMaps;
 		taskCollections = collections.map(collection => ({
 			id: collection.id,
 			name: collection.name.trim(),
 			tasks: collection.tasks.map(task => task.trim())
 		}));
+		const retainedIds = new Set(taskCollections.map(collection => collection.id));
+		collectionMaps = Object.assign(Object.create(null), collectionMaps);
+		for (const collectionId of Object.keys(collectionMaps)) {
+			if (!retainedIds.has(collectionId)) delete collectionMaps[collectionId];
+		}
 		selectedTaskCollectionId = selectedCollection.id;
 		gameConfig.tasks = selectedCollection.tasks.slice();
 		if (!persistState()) {
 			taskCollections = previousCollections;
 			selectedTaskCollectionId = previousSelectedCollectionId;
 			gameConfig.tasks = previousConfiguredTasks;
+			collectionMaps = previousCollectionMaps;
 			return reply({ ok: false, reason: 'persistence-unavailable' });
+		}
+		for (const [collectionId, map] of Object.entries(previousCollectionMaps)) {
+			if (!collectionMaps[collectionId]) removeCollectionMapFile(map);
 		}
 		reply({
 			ok: true,
-			collections: taskCollections,
+			collections: getTaskCollectionsSnapshot(),
 			selectedTaskCollectionId
 		});
 		broadcastAdminState();
@@ -641,6 +737,7 @@ io.on('connection', socket => {
 		emergencyCooldownEndMs = 0;
 		lastMeetingType = null;
 		io.emit('game-started');
+		io.emit('state', getStateSnapshot(false));
 		io.emit('cooldown-updated', { emergencyCooldownEndMs });
 		persistState();
 		console.log('[game-started]');
@@ -721,7 +818,9 @@ io.on('connection', socket => {
 			}
 		}
 		taskProgress = Object.create(null);
+		emitTaskProgress();
 		io.emit('game-ended');
+		io.emit('state', getStateSnapshot(false));
 		io.emit('cooldown-updated', { emergencyCooldownEndMs });
 		persistState();
 		broadcastPlayersToAdmins();
@@ -836,10 +935,11 @@ function getStateSnapshot(includeAdminData) {
 		isMeeting,
 		isGameActive,
 		emergencyCooldownEndMs,
+		mapUrl: getCollectionMapUrl(selectedTaskCollectionId),
 		config: includeAdminData ? gameConfig : undefined,
 		sabotageEndMs,
 		sabotageChargesRemaining,
-		taskCollections: includeAdminData ? taskCollections : undefined,
+		taskCollections: includeAdminData ? getTaskCollectionsSnapshot() : undefined,
 		selectedTaskCollectionId: includeAdminData ? selectedTaskCollectionId : undefined,
 		players: includeAdminData ? getConnectedPlayers() : undefined
 	};
@@ -869,6 +969,7 @@ function persistState() {
 	const snapshot = {
 		version: 1,
 		adminSessions,
+		collectionMaps,
 		taskCollections,
 		selectedTaskCollectionId,
 		gameConfig,
@@ -966,6 +1067,16 @@ function loadPersistentState() {
 				!Object.values(saved.adminSessions).every(expiresAt => Number.isFinite(expiresAt)))) {
 			throw new Error('Saved state contains invalid admin sessions');
 		}
+		if (saved.collectionMaps !== undefined &&
+			(!isRecord(saved.collectionMaps) ||
+				!Object.entries(saved.collectionMaps).every(([collectionId, map]) =>
+					/^[a-zA-Z0-9_-]{1,80}$/.test(collectionId) &&
+					isRecord(map) &&
+					/^[a-f0-9]{32}\.(jpg|png|webp)$/.test(map.filename) &&
+					['image/jpeg', 'image/png', 'image/webp'].includes(map.mimeType)
+				))) {
+			throw new Error('Saved state contains invalid collection maps');
+		}
 
 		if (saved.gameConfig && typeof saved.gameConfig === 'object') {
 			gameConfig = { ...gameConfig, ...saved.gameConfig };
@@ -988,6 +1099,12 @@ function loadPersistentState() {
 			taskCollections.some(collection => collection.id === saved.selectedTaskCollectionId)
 			? saved.selectedTaskCollectionId
 			: taskCollections[0].id;
+		collectionMaps = Object.assign(Object.create(null), saved.collectionMaps || {});
+		for (const collectionId of Object.keys(collectionMaps)) {
+			if (!taskCollections.some(collection => collection.id === collectionId)) {
+				delete collectionMaps[collectionId];
+			}
+		}
 		playerDirectory = Object.assign(Object.create(null), saved.playerDirectory);
 		pushSubscriptions = Object.assign(Object.create(null), saved.pushSubscriptions || {});
 		adminSessions = Object.assign(Object.create(null), saved.adminSessions || {});
@@ -1034,12 +1151,63 @@ function hashAdminSession(token) {
 	return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+function isValidAdminSessionToken(authorization) {
+	if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) return false;
+	const token = authorization.slice(7);
+	if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return false;
+	const expiresAt = adminSessions[hashAdminSession(token)];
+	return Number.isFinite(expiresAt) && expiresAt > Date.now();
+}
+
 function isAuthenticatedAdmin(socket) {
 	const sessionHash = socket.data.adminSessionHash;
 	return socket.data.isAdmin === true &&
 		typeof sessionHash === 'string' &&
 		Number.isFinite(adminSessions[sessionHash]) &&
 		adminSessions[sessionHash] > Date.now();
+}
+
+function getSupportedImage(body, contentType) {
+	if (!Buffer.isBuffer(body) || body.length === 0) return null;
+	if (contentType === 'image/jpeg' &&
+		body[0] === 0xff && body[1] === 0xd8 && body[2] === 0xff) {
+		return { bytes: body, extension: 'jpg', mimeType: contentType };
+	}
+	if (contentType === 'image/png' &&
+		body.length >= 8 &&
+		body.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+		return { bytes: body, extension: 'png', mimeType: contentType };
+	}
+	if (contentType === 'image/webp' &&
+		body.length >= 12 &&
+		body.toString('ascii', 0, 4) === 'RIFF' &&
+		body.toString('ascii', 8, 12) === 'WEBP') {
+		return { bytes: body, extension: 'webp', mimeType: contentType };
+	}
+	return null;
+}
+
+function removeCollectionMapFile(map) {
+	if (!map || !/^[a-f0-9]{32}\.(jpg|png|webp)$/.test(map.filename)) return;
+	const mapPath = path.join(DATA_DIR, 'maps', map.filename);
+	try {
+		if (fs.existsSync(mapPath)) fs.unlinkSync(mapPath);
+	} catch (error) {
+		console.error('[maps] Unable to remove collection map:', error);
+	}
+}
+
+function getCollectionMapUrl(collectionId) {
+	return collectionMaps[collectionId]
+		? `/api/maps/${encodeURIComponent(collectionId)}`
+		: null;
+}
+
+function getTaskCollectionsSnapshot() {
+	return taskCollections.map(collection => ({
+		...collection,
+		mapUrl: getCollectionMapUrl(collection.id)
+	}));
 }
 
 function isValidTaskCollections(collections) {
@@ -1104,11 +1272,20 @@ async function notifyMeetingPlayers(title, body) {
 }
 
 function emitTaskProgress() {
+	const progress = getGlobalProgress();
+	io.emit('progress', progress.ratio);
+	io.emit('global-progress', progress);
+	console.log('[progress]', progress);
+}
+
+function getGlobalProgress() {
 	const tasks = Object.values(taskProgress);
-	const completed = tasks.filter(task => task).length;
-	const total = tasks.length ? completed / tasks.length : 0;
-	io.emit('progress', total);
-	console.log('[progress]', { completed, totalTasks: tasks.length, ratio: total });
+	const completed = tasks.filter(Boolean).length;
+	return {
+		completed,
+		total: tasks.length,
+		ratio: tasks.length ? completed / tasks.length : 0
+	};
 
 	if (tasks.length > 0 && total === 1) {
 		io.emit('play-win');

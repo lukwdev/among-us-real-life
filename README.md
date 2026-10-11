@@ -30,7 +30,7 @@ You may want to modify the following properties located in [`src/index.js`](http
 
 You can also change the task count from the admin dashboard before starting a round. The assignment logic now keeps every player’s task list unique and prevents one task label from exceeding the configured per-task cap.
 
-Task collections are managed in the admin dashboard. Create a collection for each game location, add or remove tasks, and save it; the selected collection is used when the next game starts. Collections are stored in the server data file and survive restarts.
+Task collections are managed in the admin dashboard. Create a collection for each game location, add or remove tasks, and save it; the selected collection is used when the next game starts. Each collection can also have its own JPG, PNG, or WebP map (up to 10 MB), saved alongside persistent server data and shown to players during that collection's game. The admin dashboard shows global task completion across all players.
 
 Players join by entering a name. Names are case-insensitive and must be unique while connected; the admin dashboard shows all players who have logged in and whether each is currently connected. Admins can remove saved players from the roster when a game is not active; removing a connected player also disconnects them. The roster, game settings, roles, task progress, and active round are saved in `DATA_DIR` (defaults to `data/`) and restored after a backend restart. Keep this directory on persistent storage when deploying; the provided Compose configuration mounts a named volume for it.
 

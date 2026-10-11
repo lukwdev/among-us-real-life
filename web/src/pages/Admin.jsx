@@ -1,7 +1,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { Alert, Box, Button, Card, CardContent, Chip, Divider, FormControl, IconButton, InputLabel, List, ListItem, ListItemText, MenuItem, Paper, Select, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material';
+import { Alert, Box, Button, Card, CardContent, Chip, Divider, FormControl, IconButton, InputLabel, LinearProgress, List, ListItem, ListItemText, MenuItem, Paper, Select, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 
 export default function Admin() {
@@ -46,6 +46,8 @@ export default function Admin() {
     const [connectedPlayers, setConnectedPlayers] = useState([]);
     const [startError, setStartError] = useState('');
     const [playerManagementMessage, setPlayerManagementMessage] = useState('');
+    const [globalProgress, setGlobalProgress] = useState({ completed: 0, total: 0, ratio: 0 });
+    const [mapUploadInProgress, setMapUploadInProgress] = useState(false);
 
     useEffect(() => {
         if (!loginAttempt) return;
@@ -174,6 +176,13 @@ export default function Admin() {
                 setConnectedPlayers(players);
             }
         });
+        socket.on('global-progress', (progress) => {
+            if (Number.isFinite(progress?.completed) &&
+                Number.isFinite(progress?.total) &&
+                Number.isFinite(progress?.ratio)) {
+                setGlobalProgress(progress);
+            }
+        });
         socket.on('start-error', (error) => {
             const reason = error?.reason;
             const messages = {
@@ -228,6 +237,7 @@ export default function Admin() {
             onSaved?.(false);
             return;
         }
+
         socketRef.current?.timeout(10000).emit('save-task-collections', {
             collections: taskCollections,
             selectedTaskCollectionId
@@ -246,6 +256,90 @@ export default function Admin() {
             setSelectedTaskCollectionId(response.selectedTaskCollectionId);
             onSaved?.(true);
         });
+    }
+
+    function uploadCollectionMap(file) {
+        if (!file) return;
+        if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 10 * 1024 * 1024) {
+            setCollectionError('Choose a JPG, PNG, or WebP image smaller than 10 MB.');
+            return;
+        }
+        const selected = taskCollections.find((collection) => collection.id === selectedTaskCollectionId);
+        if (!selected) {
+            setCollectionError('Select a collection before uploading its map.');
+            return;
+        }
+        setMapUploadInProgress(true);
+        saveTaskCollections((saved) => {
+            if (!saved) {
+                setMapUploadInProgress(false);
+                return;
+            }
+            const token = adminSessionTokenRef.current || (() => {
+                try {
+                    return localStorage.getItem('adminSession') || '';
+                } catch (error) {
+                    console.warn('Could not read the saved admin session for map upload.', error);
+                    return '';
+                }
+            })();
+            if (!token) {
+                setMapUploadInProgress(false);
+                setCollectionError('Your admin session is not available. Sign in again before uploading a map.');
+                return;
+            }
+            fetch(`/api/admin/collections/${encodeURIComponent(selected.id)}/map`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': file.type
+                },
+                body: file
+            }).then(async (response) => {
+                const result = await response.json().catch(() => ({}));
+                if (!response.ok || !result.ok) {
+                    const messages = {
+                        unauthorized: 'Your admin session expired. Sign in again before uploading a map.',
+                        'collection-not-found': 'Save the collection before uploading its map.',
+                        'unsupported-image': 'The server could not read this image. Use a JPG, PNG, or WebP file.',
+                        'persistence-unavailable': 'The server could not save the map.'
+                    };
+                    throw new Error(messages[result.error] || 'Could not upload the map. Check the connection and try again.');
+                }
+                setTaskCollections((current) => current.map((collection) => collection.id === selected.id
+                    ? { ...collection, mapUrl: result.mapUrl }
+                    : collection));
+                setCollectionError('');
+            }).catch((error) => {
+                setCollectionError(error.message || 'Could not upload the map. Check the connection and try again.');
+            }).finally(() => setMapUploadInProgress(false));
+        });
+    }
+
+    async function removeCollectionMap() {
+        const token = adminSessionTokenRef.current;
+        if (!selectedTaskCollectionId || !token) return;
+        setMapUploadInProgress(true);
+        try {
+            const response = await fetch(`/api/admin/collections/${encodeURIComponent(selectedTaskCollectionId)}/map`, {
+                method: 'DELETE',
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || !result.ok) {
+                throw new Error(result.error === 'persistence-unavailable'
+                    ? 'The server could not remove the map.'
+                    : 'Could not remove the map. Check the connection and try again.');
+            }
+            setTaskCollections((current) => current.map((collection) => collection.id === selectedTaskCollectionId
+                ? { ...collection, mapUrl: null }
+                : collection));
+            setCollectionError('');
+        } catch (error) {
+            setCollectionError(error.message || 'Could not remove the map. Check the connection and try again.');
+        } finally {
+            setMapUploadInProgress(false);
+        }
     }
 
     function addCollection() {
@@ -439,6 +533,30 @@ export default function Admin() {
                 {playerManagementMessage && <Alert severity="info">{playerManagementMessage}</Alert>}
                 {collectionError && <Alert severity="error">{collectionError}</Alert>}
 
+                <Card>
+                    <CardContent>
+                        <Stack spacing={1}>
+                            <Stack direction="row" justifyContent="space-between" alignItems="baseline">
+                                <Typography variant="h6">Global task progress</Typography>
+                                <Typography variant="body2">
+                                    {globalProgress.completed} / {globalProgress.total} tasks
+                                    {globalProgress.total > 0 ? ` · ${(globalProgress.ratio * 100).toFixed(0)}%` : ''}
+                                </Typography>
+                            </Stack>
+                            <LinearProgress
+                                variant="determinate"
+                                value={globalProgress.ratio * 100}
+                                aria-label="Global task progress"
+                            />
+                            {globalProgress.total === 0 && (
+                                <Typography variant="caption" color="text.secondary">
+                                    Progress appears when a game is in progress.
+                                </Typography>
+                            )}
+                        </Stack>
+                    </CardContent>
+                </Card>
+
                 <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', md: 'minmax(0, 1.2fr) minmax(360px, 0.8fr)' }, gap: 2, alignItems: 'start' }}>
                 <Card sx={{ width: '100%', minWidth: 0 }}>
                     <CardContent>
@@ -546,10 +664,68 @@ export default function Admin() {
                                                 ))}
                                             </Select>
                                         </FormControl>
-                                        <Button color="error" variant="outlined" onClick={deleteCollection} disabled={!isConnected || taskCollections.length <= 1}>
-                                            Delete
-                                        </Button>
+                                        <Stack direction="row" spacing={1}>
+                                            <Button color="error" variant="outlined" onClick={deleteCollection} disabled={!isConnected || taskCollections.length <= 1}>
+                                                Delete
+                                            </Button>
+                                            <Button
+                                                component="label"
+                                                variant="outlined"
+                                                disabled={!isConnected || mapUploadInProgress}
+                                            >
+                                                {mapUploadInProgress ? 'Saving map…' : 'Upload map'}
+                                                <input
+                                                    hidden
+                                                    type="file"
+                                                    accept="image/jpeg,image/png,image/webp"
+                                                    onChange={(event) => {
+                                                        uploadCollectionMap(event.target.files?.[0]);
+                                                        event.target.value = '';
+                                                    }}
+                                                />
+                                            </Button>
+                                        </Stack>
                                     </Stack>
+                                    {(() => {
+                                        const selectedCollection = taskCollections.find((collection) => collection.id === selectedTaskCollectionId);
+                                        if (!selectedCollection) return null;
+                                        return (
+                                            <Paper variant="outlined" sx={{ p: 1.5 }}>
+                                                <Stack spacing={1}>
+                                                    <Typography variant="subtitle2">
+                                                        {selectedCollection.mapUrl ? 'Collection map' : 'Default map'}
+                                                    </Typography>
+                                                    <Box
+                                                        component="img"
+                                                        src={selectedCollection.mapUrl || '/images/MAP.JPG'}
+                                                        alt={`${selectedCollection.name} map`}
+                                                        sx={{
+                                                            display: 'block',
+                                                            width: '100%',
+                                                            maxHeight: 240,
+                                                            objectFit: 'contain',
+                                                            bgcolor: 'action.hover',
+                                                            borderRadius: 1
+                                                        }}
+                                                        onError={(event) => {
+                                                            event.currentTarget.style.display = 'none';
+                                                        }}
+                                                    />
+                                                    {selectedCollection.mapUrl && (
+                                                        <Button
+                                                            color="error"
+                                                            size="small"
+                                                            variant="text"
+                                                            onClick={removeCollectionMap}
+                                                            disabled={!isConnected || mapUploadInProgress}
+                                                        >
+                                                            Remove custom map
+                                                        </Button>
+                                                    )}
+                                                </Stack>
+                                            </Paper>
+                                        );
+                                    })()}
                                     <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: '100%' }}>
                                         <TextField
                                             label="New collection name"

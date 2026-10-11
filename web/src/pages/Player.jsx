@@ -40,6 +40,7 @@ export default function Player() {
   const [isImpostor, setIsImpostor] = useState(false);
   const [killCooldownRemainingMs, setKillCooldownRemainingMs] = useState(0);
   const [mapOpen, setMapOpen] = useState(false);
+  const [mapUrl, setMapUrl] = useState('');
   const [audioReady, setAudioReady] = useState(false);
   const [sabotageEndMs, setSabotageEndMs] = useState(0);
   const isSabotageActive = sabotageEndMs > Date.now();
@@ -144,7 +145,12 @@ export default function Player() {
       setTasks({});
       setProgress(0);
     });
-    socket.on('state', (s) => { setMeeting(!!s?.isMeeting); setGameActive(!!s?.isGameActive); if (typeof s?.sabotageChargesRemaining === 'number') setSabotageChargesRemaining(s.sabotageChargesRemaining); });
+    socket.on('state', (s) => {
+      setMeeting(!!s?.isMeeting);
+      setGameActive(!!s?.isGameActive);
+      setMapUrl(typeof s?.mapUrl === 'string' ? s.mapUrl : '');
+      if (typeof s?.sabotageChargesRemaining === 'number') setSabotageChargesRemaining(s.sabotageChargesRemaining);
+    });
     socket.on('sabotage-started', ({ endMs }) => {
       setSabotageEndMs(endMs || 0);
       playerActionsRef.current.playLoop('/sounds/sabotage.mp3', endMs);
@@ -458,7 +464,7 @@ export default function Player() {
         </Tooltip>
         <Dialog open={mapOpen} onClose={() => setMapOpen(false)} maxWidth="lg">
           <DialogContent sx={{ p: 0 }}>
-            <Box component="img" src="/images/MAP.JPG" alt="Map" sx={{ maxWidth: '90vw', maxHeight: '80vh', display: 'block' }} />
+            <Box component="img" src={mapUrl || '/images/MAP.JPG'} alt="Map" sx={{ maxWidth: '90vw', maxHeight: '80vh', display: 'block' }} />
           </DialogContent>
         </Dialog>
       </Stack>
@@ -571,7 +577,7 @@ export default function Player() {
 
       <Dialog open={mapOpen} onClose={() => setMapOpen(false)} maxWidth="lg">
         <DialogContent sx={{ p: 0 }}>
-          <Box component="img" src="/images/MAP.JPG" alt="Map" sx={{ maxWidth: '90vw', maxHeight: '80vh', display: 'block' }} />
+          <Box component="img" src={mapUrl || '/images/MAP.JPG'} alt="Map" sx={{ maxWidth: '90vw', maxHeight: '80vh', display: 'block' }} />
         </DialogContent>
       </Dialog>
     </Stack>

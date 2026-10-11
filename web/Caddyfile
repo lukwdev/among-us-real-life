@@ -1,9 +1,8 @@
 :80 {
     # Use a named matcher to group the paths.
     @api {
-        path /images/*
+        path /api/*
         path /socket.io/*
-        path /sounds/*
     }
 
     # Use the named matcher in the route directive.
