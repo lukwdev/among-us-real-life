@@ -56,6 +56,26 @@ Back up the `game-data` Docker volume, which contains both `game-state.json` and
 
 Hosting platforms with ephemeral disks (including free Render services) will lose saved game state on redeploy or restart unless you attach persistent storage and set `DATA_DIR` to its mount path.
 
+### Automatic container images
+
+The GitHub Actions workflow `.github/workflows/container-images.yml` runs the tests and publishes both images to GitHub Container Registry after every push to `master`:
+
+```text
+ghcr.io/lukwdev/among-us-real-life-backend:latest
+ghcr.io/lukwdev/among-us-real-life-frontend:latest
+```
+
+On the server, clone the repository once, create the root `.env`, and update the deployment after a successful workflow run:
+
+```sh
+docker login ghcr.io
+docker compose pull
+docker compose up -d
+docker compose logs -f
+```
+
+Use a GitHub token with **read:packages** permission for `docker login` if the images are private. Keep the token out of `.env` and source control. The Compose file still contains both Docker build definitions, so `docker compose up --build -d` remains available for local builds. To deploy a specific immutable build instead of `latest`, set `BACKEND_IMAGE` and `FRONTEND_IMAGE` in `.env` to the matching `:sha-<commit>` image tags.
+
 ### Backend structure
 
 - `src/index.js` wires configuration, HTTP, Socket.IO, and game lifecycle events.
