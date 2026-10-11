@@ -46,7 +46,7 @@ docker compose up --build -d
 docker compose logs -f
 ```
 
-The app listens on `127.0.0.1:8080` by default. Point your existing reverse proxy at that address, terminate TLS there, and enable WebSocket upgrades for `/socket.io/`. The browser-facing site must use HTTPS for push notifications and is strongly recommended for normal use. If the reverse proxy is in another container, set `APP_BIND_ADDRESS=0.0.0.0` or attach it to the Compose network and proxy to the `frontend` service. Optionally set `CORS_ORIGIN` to your public origin (for example, `https://among.example.com`).
+The app listens on `127.0.0.1:8080` by default. Point your existing reverse proxy only at the `frontend` service; Caddy forwards `/api`, `/socket.io`, and `/healthz` internally to the backend. Terminate TLS at your reverse proxy and enable WebSocket upgrades for `/socket.io/`. The browser-facing site must use HTTPS for push notifications and is strongly recommended for normal use. If the reverse proxy is in another container, set `APP_BIND_ADDRESS=0.0.0.0` or attach it to the Compose network and proxy to the `frontend` service. Optionally set `CORS_ORIGIN` to your public origin (for example, `https://among.example.com`).
 
 Back up the `game-data` Docker volume, which contains both `game-state.json` and uploaded collection maps. A container restart preserves it; deleting the volume does not. To restore, stop the app, restore the volume backup, then start the app. Do not run multiple backend replicas with this file-based storage, because each replica would have independent state.
 
