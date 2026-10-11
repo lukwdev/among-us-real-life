@@ -4,6 +4,10 @@ const socket = io({
 	}
 });
 
+const login$ = document.querySelector('#admin-login');
+const adminCode$ = document.querySelector('#admin-code');
+const loginError$ = document.querySelector('#login-error');
+const dashboard$ = document.querySelector('#admin-dashboard');
 const startGame$ = document.querySelector('#start-game');
 const players$ = document.querySelector('#players');
 const playerCount$ = document.querySelector('#player-count');
@@ -32,6 +36,22 @@ socket.on('start-error', error => {
 	adminError$.textContent = error?.reason === 'no-players'
 		? 'At least one player must be connected before starting.'
 		: 'The game could not be started.';
+});
+
+login$.addEventListener('submit', event => {
+	event.preventDefault();
+	socket.timeout(10000).emit('admin-login', { code: adminCode$.value }, (timeoutError, response) => {
+		if (timeoutError || !response?.ok) {
+			loginError$.textContent = response?.reason === 'admin-not-configured'
+				? 'ADMIN_CODE is not configured on the server.'
+				: 'The admin code is incorrect or the server could not verify it.';
+			return;
+		}
+		loginError$.textContent = '';
+		login$.hidden = true;
+		dashboard$.hidden = false;
+		socket.emit('get-state');
+	});
 });
 
 startGame$.addEventListener('click', () => {

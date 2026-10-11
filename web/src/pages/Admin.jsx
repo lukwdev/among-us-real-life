@@ -7,6 +7,11 @@ import DeleteIcon from '@mui/icons-material/Delete';
 export default function Admin() {
     const [authorized, setAuthorized] = useState(false);
     const [adminCode, setAdminCode] = useState('');
+    const adminCodeRef = useRef(adminCode);
+    adminCodeRef.current = adminCode;
+    const [loginAttempt, setLoginAttempt] = useState(0);
+    const [loginError, setLoginError] = useState('');
+    const [isAuthenticating, setIsAuthenticating] = useState(false);
     const [authId] = useState(() => {
         // simple per-tab admin id
         let a = sessionStorage.getItem('adminAuth');
@@ -31,9 +36,31 @@ export default function Admin() {
     const [startError, setStartError] = useState('');
 
     useEffect(() => {
-        if (!authorized) return;
-        const socket = io({ query: { role: 'ADMIN' } });
+        if (!loginAttempt) return;
+        const socket = io({ query: { role: 'ADMIN' }, reconnection: true });
         socketRef.current = socket;
+
+        socket.on('connect', () => {
+            setIsAuthenticating(true);
+            socket.timeout(10000).emit('admin-login', { code: adminCodeRef.current }, (timeoutError, response) => {
+                setIsAuthenticating(false);
+                if (timeoutError || !response?.ok) {
+                    setLoginError(response?.reason === 'admin-not-configured'
+                        ? 'The server administrator has not configured ADMIN_CODE.'
+                        : 'The admin code is incorrect or the server could not verify it.');
+                    setAuthorized(false);
+                    socket.disconnect();
+                    return;
+                }
+                setLoginError('');
+                setAuthorized(true);
+                socket.emit('get-state');
+            });
+        });
+        socket.on('connect_error', () => {
+            setIsAuthenticating(false);
+            setLoginError('Could not connect to the server. Check the connection and try again.');
+        });
 
         socket.on('play-meeting', async () => {
             await waitMs(2000);
@@ -87,7 +114,7 @@ export default function Admin() {
         });
 
         return () => socket.disconnect();
-    }, [authorized]);
+    }, [loginAttempt]);
 
     useEffect(() => {
         if (!authorized) return;
@@ -128,6 +155,20 @@ export default function Admin() {
         socketRef.current?.emit('continue-game');
     }
 
+    function endGame() {
+        socketRef.current?.emit('end-game');
+    }
+
+    function login() {
+        if (!adminCode) {
+            setLoginError('Enter the admin code.');
+            return;
+        }
+        setLoginError('');
+        setIsAuthenticating(true);
+        setLoginAttempt((attempt) => attempt + 1);
+    }
+
     // Cooldown countdown tick
     useEffect(() => {
         const i = setInterval(() => {
@@ -150,8 +191,6 @@ export default function Admin() {
         await new Promise((r) => setTimeout(r, ms));
     }
 
-    // Removed auto-login; require code entry each visit
-
     if (!authorized) {
         return (
             <Stack spacing={2} alignItems="center" sx={{ py: 3 }}>
@@ -159,18 +198,13 @@ export default function Admin() {
                     <CardContent>
                         <Stack spacing={2}>
                             <Typography variant="h6" gutterBottom>Admin Access</Typography>
+                            {loginError && <Typography color="error" role="alert">{loginError}</Typography>}
                             <TextField label="Admin Code" type="password" value={adminCode} onChange={(e) => setAdminCode(e.target.value)} onKeyDown={(e) => {
-                                if (e.key === 'Enter') {
-                                    if (adminCode && adminCode === import.meta.env.VITE_ADMIN_CODE) {
-                                        setAuthorized(true);
-                                    }
-                                }
+                                if (e.key === 'Enter') login();
                             }} fullWidth />
-                            <Button variant="contained" onClick={() => {
-                                if (adminCode && adminCode === import.meta.env.VITE_ADMIN_CODE) {
-                                    setAuthorized(true);
-                                }
-                            }}>Enter</Button>
+                            <Button variant="contained" onClick={login} disabled={isAuthenticating}>
+                                {isAuthenticating ? 'Checking…' : 'Enter'}
+                            </Button>
                         </Stack>
                     </CardContent>
                 </Card>
@@ -289,6 +323,9 @@ export default function Admin() {
                                     <Typography variant="h5" color="error">MEETING TIME</Typography>
                                     <Button variant="contained" onClick={continueGame}>Continue</Button>
                                 </>
+                            )}
+                            {gameActive && (
+                                <Button variant="outlined" color="error" onClick={endGame}>End Game</Button>
                             )}
                         </Stack>
                     </CardContent>

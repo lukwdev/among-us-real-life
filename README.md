@@ -32,7 +32,28 @@ You can also change the task count from the admin dashboard before starting a ro
 
 Players join by entering a name. Names are case-insensitive and must be unique while connected; the admin dashboard shows all players who have logged in and whether each is currently connected. The roster, game settings, roles, task progress, and active round are saved in `DATA_DIR` (defaults to `data/`) and restored after a backend restart. Keep this directory on persistent storage when deploying; the provided Compose configuration mounts a named volume for it.
 
-### 2. Start the backend
+### 2. Deploy with Docker Compose
+
+The Compose setup builds the frontend and backend, keeps game data in a named volume, waits for the backend health check, and restarts crashed containers.
+
+```sh
+cp .env.example .env
+```
+
+Set a strong, private `ADMIN_CODE` in `.env`. For background meeting notifications, generate a VAPID key pair with `npx web-push generate-vapid-keys` and set both `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY`; leave both empty to disable push notifications. Set `PUSH_SUBJECT` to a contact email or an HTTPS URL. Keep the private key and `.env` out of source control.
+
+```sh
+docker compose up --build -d
+docker compose logs -f
+```
+
+The app listens on `127.0.0.1:8080` by default. Point your existing reverse proxy at that address, terminate TLS there, and enable WebSocket upgrades for `/socket.io/`. The browser-facing site must use HTTPS for push notifications and is strongly recommended for normal use. If the reverse proxy is in another container, set `APP_BIND_ADDRESS=0.0.0.0` or attach it to the Compose network and proxy to the `frontend` service. Optionally set `CORS_ORIGIN` to your public origin (for example, `https://among.example.com`).
+
+Back up the `game-data` Docker volume. A container restart preserves it; deleting the volume does not. Do not run multiple backend replicas with this file-based storage, because each replica would have independent state.
+
+Hosting platforms with ephemeral disks (including free Render services) will lose saved game state on redeploy or restart unless you attach persistent storage and set `DATA_DIR` to its mount path.
+
+### 3. Run locally without Docker
 
 Start the backend with
 
@@ -43,15 +64,17 @@ $ npm start
 
 :information_source: Use a utility like [Nodemon](https://nodemon.io/) to automatically restart the backend upon any changes. This is useful when modifying the number of impostors or tasks.
 
-### 3. Connect to the admin dashboard
+### 4. Connect to the admin dashboard
 
-Visit [http://localhost:4046/admin](http://localhost:4046/admin) to access the admin panel. There is a single button to start the game.
+Visit `/admin` on your deployed site and enter the `ADMIN_CODE` configured on the server. The code is verified by the backend; it is not compiled into the frontend.
 
 Pressing the start button will reset task progress, assign new tasks, and assign impostors. Press it once all players connect, otherwise you will have to press it again.
 
-### 4. Invite friends to join
+### 5. Invite friends to join
 
-Players may access the the game at [http://localhost:4046](http://localhost:4046). On other computers (or phones), you will need to enter the computer's local IP or use a tunneling service like [ngrok](https://ngrok.com). Alternatively, you could deploy this yourself.
+Players open the site on their phones and sign in with their name. They can opt in to meeting push notifications from the player screen. Push notifications are sent directly from this server using standard Web Push; Firebase is not required. Browser support varies, and iPhone/iPad users generally need to add the HTTPS site to their Home Screen before enabling web push. Notification delivery also depends on the browser and operating system.
+
+The existing in-page sounds alone do not cover a screen that is locked or a browser suspended in the background. A service worker and Web Push can alert players in that situation once they have opted in, but a web app cannot guarantee delivery if notifications are blocked, the device is offline, or the OS suppresses them.
 
 ## Known issues
 

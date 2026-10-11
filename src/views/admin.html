@@ -10,12 +10,20 @@
 	</head>
 	<body>
 		<h1>Admin</h1>
+		<form id="admin-login">
+			<label for="admin-code">Admin code</label>
+			<input id="admin-code" type="password" required />
+			<button type="submit">Enter</button>
+			<p id="login-error" role="alert"></p>
+		</form>
+		<main id="admin-dashboard" hidden>
 		<h2>Players</h2>
 		<p id="player-count">0 connected</p>
 		<ul id="players"></ul>
 		<p id="admin-error" role="alert"></p>
 
 		<button id="start-game">Start Game</button>
+		</main>
 
 		<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.min.js" integrity="sha512-eVL5Lb9al9FzgR63gDs1MxcDS2wFu3loYAgjIH0+Hg38tCS8Ag62dwKyH+wzDb+QauDpEZjXbMn11blw8cbTJQ==" crossorigin="anonymous"></script>
 		<script src="/admin.js"></script>

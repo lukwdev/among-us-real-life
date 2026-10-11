@@ -9,6 +9,13 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20
-      - key: VITE_ADMIN_CODE
+      - key: ADMIN_CODE
         sync: false
-
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: PUSH_SUBJECT
+        value: mailto:admin@example.com
+      - key: DATA_DIR
+        value: data

@@ -3,6 +3,12 @@ import { io } from 'socket.io-client';
 import { Alert, Backdrop, Box, Button, Card, CardContent, Checkbox, FormControlLabel, IconButton, LinearProgress, List, ListItem, ListItemText, Stack, TextField, Tooltip, Typography, Dialog, DialogContent } from '@mui/material';
 import MapIcon from '@mui/icons-material/Map';
 
+function decodeVapidKey(key) {
+  const padding = '='.repeat((4 - (key.length % 4)) % 4);
+  const base64 = (key + padding).replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(window.atob(base64), (character) => character.charCodeAt(0));
+}
+
 export default function Player() {
   const [tasks, setTasks] = useState({});
   const [completed, setCompleted] = useState({});
@@ -20,6 +26,10 @@ export default function Player() {
   const [loginAttempt, setLoginAttempt] = useState(0);
   const [loginError, setLoginError] = useState('');
   const [isConnected, setIsConnected] = useState(false);
+  const [pushEnabled, setPushEnabled] = useState(false);
+  const [pushPublicKey, setPushPublicKey] = useState('');
+  const [pushMessage, setPushMessage] = useState('');
+  const [pushSubscriptionSaved, setPushSubscriptionSaved] = useState(false);
   const audioRef = useRef(null);
   const socketRef = useRef(null);
   const playerActionsRef = useRef({});
@@ -63,6 +73,27 @@ export default function Player() {
         } catch {
           console.warn('Could not save the player name in browser storage.');
         }
+        socket.timeout(5000).emit('get-push-config', (configError, config) => {
+          if (configError) {
+            setPushMessage('Could not check notification support. Reconnect and try again.');
+            return;
+          }
+          if (!config?.enabled) {
+            setPushMessage('Notifications are not configured on the server.');
+            return;
+          }
+          if (!window.isSecureContext || !('Notification' in window) || !('serviceWorker' in navigator)) {
+            setPushMessage('Push notifications require HTTPS and a supported browser.');
+            return;
+          }
+          setPushEnabled(true);
+          setPushPublicKey(config.publicKey);
+          if (Notification.permission === 'granted') {
+            syncPushSubscription(socket, config.publicKey);
+          } else if (Notification.permission === 'denied') {
+            setPushMessage('Notifications are blocked in your browser settings.');
+          }
+        });
       });
     });
     socket.on('disconnect', () => setIsConnected(false));
@@ -121,6 +152,46 @@ export default function Player() {
       socket.disconnect();
     };
   }, [playerName, loginAttempt]);
+
+  async function syncPushSubscription(socket, publicKey, requestPermission = false) {
+    try {
+      if (!window.isSecureContext || !('Notification' in window) || !('serviceWorker' in navigator)) {
+        throw new Error('Push notifications require HTTPS and a supported browser.');
+      }
+      let permission = Notification.permission;
+      if (permission === 'default' && requestPermission) {
+        permission = await Notification.requestPermission();
+      }
+      if (permission !== 'granted') {
+        throw new Error(permission === 'denied'
+          ? 'Notifications are blocked in your browser settings.'
+          : 'Allow notifications to receive meeting alerts.');
+      }
+      const registration = await navigator.serviceWorker.register('/sw.js');
+      let subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: decodeVapidKey(publicKey)
+        });
+      }
+      const response = await new Promise((resolve, reject) => {
+        socket.timeout(10000).emit('save-push-subscription', { subscription: subscription.toJSON() }, (error, result) => {
+          if (error) reject(new Error('The server did not save your notification settings.'));
+          else if (!result?.ok) reject(new Error(result?.reason === 'persistence-unavailable'
+            ? 'The server could not save your notification settings.'
+            : 'The server could not enable notifications.'));
+          else resolve(result);
+        });
+      });
+      setPushSubscriptionSaved(true);
+      setPushMessage(response.ok ? 'Meeting notifications are enabled on this device.' : '');
+    } catch (error) {
+      console.error('Could not enable push notifications:', error);
+      setPushSubscriptionSaved(false);
+      setPushMessage(error.message || 'Could not enable notifications.');
+    }
+  }
 
   function loginWithName(event) {
     event.preventDefault();
@@ -350,6 +421,12 @@ export default function Player() {
       <Stack spacing={2} alignItems="center" sx={{ width: '100%' }}>
         <Typography variant="overline">Player ({playerName})</Typography>
         {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
+        {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
+        {isConnected && pushEnabled && !pushSubscriptionSaved && (
+          <Button variant="outlined" onClick={() => syncPushSubscription(socketRef.current, pushPublicKey, true)}>
+            Enable meeting notifications
+          </Button>
+        )}
         <Card sx={{ width: '100%', maxWidth: 420 }}>
           <CardContent>
             <Typography variant="h5" align="center">GAME NOT STARTED</Typography>
@@ -374,6 +451,12 @@ export default function Player() {
       <Stack spacing={2} alignItems="center" sx={{ width: '100%' }}>
         <Typography variant="overline">Player ({playerName})</Typography>
         {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
+        {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
+        {isConnected && pushEnabled && !pushSubscriptionSaved && (
+          <Button variant="outlined" onClick={() => syncPushSubscription(socketRef.current, pushPublicKey, true)}>
+            Enable meeting notifications
+          </Button>
+        )}
         <Card sx={{ width: '100%', maxWidth: 420 }}>
           <CardContent>
             <Typography variant="h5" align="center">A GAME IS IN PROGRESS</Typography>
@@ -388,6 +471,12 @@ export default function Player() {
     <Stack spacing={2} alignItems="center" sx={{ width: '100%' }}>
       <Typography variant="overline">Player ({playerName})</Typography>
       {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
+      {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
+      {isConnected && pushEnabled && !pushSubscriptionSaved && (
+        <Button variant="outlined" onClick={() => syncPushSubscription(socketRef.current, pushPublicKey, true)}>
+          Enable meeting notifications
+        </Button>
+      )}
       {/* Stopwatch */}
       <Stack spacing={1} direction="row" alignItems="center">
         <Typography variant="h6" sx={{ minWidth: 72, textAlign: 'center' }}>{formatTime(stopwatchMs)}</Typography>

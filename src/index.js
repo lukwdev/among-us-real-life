@@ -3,16 +3,35 @@ const PORT = process.env.PORT || 4046;
 const express = require('express');
 const http = require('http');
 const fs = require('fs');
+const crypto = require('crypto');
 const _ = require('lodash');
 const path = require('path');
 const { Server } = require('socket.io');
-const { v4: uuid } = require('uuid');
+const webPush = require('web-push');
+
+const adminCode = process.env.ADMIN_CODE;
+const vapidPublicKey = process.env.VAPID_PUBLIC_KEY;
+const vapidPrivateKey = process.env.VAPID_PRIVATE_KEY;
+const pushSubject = process.env.PUSH_SUBJECT || 'mailto:admin@example.com';
+const pushEnabled = Boolean(vapidPublicKey && vapidPrivateKey);
+
+if (!adminCode) {
+	console.error('[config] ADMIN_CODE is not set; admin access is disabled');
+}
+if (Boolean(vapidPublicKey) !== Boolean(vapidPrivateKey)) {
+	throw new Error('Both VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY must be configured together');
+}
+if (pushEnabled) {
+	webPush.setVapidDetails(pushSubject, vapidPublicKey, vapidPrivateKey);
+}
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
 	cors: {
-		origin: [/^http:\/\/localhost:\d+$/],
+		origin: process.env.CORS_ORIGIN
+			? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim())
+			: false,
 		methods: ['GET', 'POST']
 	}
 });
@@ -96,9 +115,11 @@ let deadAuths = new Set();
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const STATE_FILE = path.join(DATA_DIR, 'game-state.json');
 let playerDirectory = Object.create(null);
+let pushSubscriptions = Object.create(null);
 
 loadPersistentState();
 
+app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
 app.use('/', express.static(path.join(__dirname, 'public')));
 
 if (process.env.NODE_ENV === 'production') {
@@ -130,34 +151,31 @@ io.on('connection', socket => {
 	console.log('[connect] socket', socket.id, 'auth', auth);
 
 	// Send current state to newly connected clients
-	socket.emit('state', getStateSnapshot());
-	broadcastPlayersToAdmins();
-
-	// If the connecting socket is an impostor, send its kill cooldown snapshot
-	if (isGameActive && impostorIds.has(socket.id)) {
-		const endMs = killCooldownEndMsBySocketId[socket.id] || 0;
-		socket.emit('kill-cooldown-updated', { endMs });
-	}
-
-	// If a player joins mid-game, rehydrate role and cooldown if known
-	if (isGameActive && socket.handshake.query.role === 'PLAYER') {
-		if (impostorAuths.has(auth)) {
-			impostorIds.add(socket.id);
-			const endMs = killCooldownEndMsByAuth[auth] || 0;
-			killCooldownEndMsBySocketId[socket.id] = endMs;
-			socket.emit('role', 'Impostor');
-			socket.emit('kill-cooldown-updated', { endMs });
-			console.log('[rehydrate] impostor', { socketId: socket.id, auth, endMs });
-		} else if (authToPlayer[auth]?.role === 'Crewmate') {
-			socket.emit('role', 'Crewmate');
-			console.log('[rehydrate] crewmate', { socketId: socket.id, auth });
-		}
-	}
+	socket.emit('state', getStateSnapshot(false));
 
 	// Allow clients to request a fresh snapshot of state
 	socket.on('get-state', () => {
-		socket.emit('state', getStateSnapshot());
+		socket.emit('state', getStateSnapshot(socket.data.isAdmin === true));
 		console.log('[get-state]', { socketId: socket.id, auth: socketIdToAuth[socket.id], isMeeting, isGameActive, emergencyCooldownEndMs });
+	});
+
+	socket.on('admin-login', (payload, acknowledge) => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		if (!adminCode) {
+			return reply({ ok: false, reason: 'admin-not-configured' });
+		}
+		const submittedCode = typeof payload?.code === 'string' ? Buffer.from(payload.code) : Buffer.alloc(0);
+		const configuredCode = typeof adminCode === 'string' ? Buffer.from(adminCode) : Buffer.alloc(0);
+		const valid = submittedCode.length === configuredCode.length &&
+			crypto.timingSafeEqual(submittedCode, configuredCode);
+		if (!valid) {
+			return reply({ ok: false, reason: 'invalid-code' });
+		}
+
+		socket.data.isAdmin = true;
+		reply({ ok: true });
+		socket.emit('state', getStateSnapshot(true));
+		socket.emit('players-updated', getConnectedPlayers());
 	});
 
 	socket.on('player-login', (payload, acknowledge) => {
@@ -197,10 +215,73 @@ io.on('connection', socket => {
 		socket.data.playerId = playerKey;
 		socketIdToAuth[socket.id] = playerKey;
 		reply({ ok: true, id: playerKey, name: playerDirectory[playerKey].name });
-		socket.emit('state', getStateSnapshot());
+		socket.emit('state', getStateSnapshot(false));
 		sendPlayerSnapshot(socket, playerKey);
 		broadcastPlayersToAdmins();
 		console.log('[player-login]', { socketId: socket.id, playerId: playerKey });
+	});
+
+	socket.on('get-push-config', acknowledge => {
+		if (typeof acknowledge === 'function') {
+			acknowledge({ enabled: pushEnabled, publicKey: pushEnabled ? vapidPublicKey : null });
+		}
+	});
+
+	socket.on('save-push-subscription', (payload, acknowledge) => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		const playerId = socket.data.playerId;
+		const subscription = payload?.subscription;
+		if (!playerId || !pushEnabled) {
+			return reply({ ok: false, reason: 'push-unavailable' });
+		}
+		if (!isValidPushSubscription(subscription)) {
+			return reply({ ok: false, reason: 'invalid-subscription' });
+		}
+
+		const subscriptionId = crypto.createHash('sha256').update(subscription.endpoint).digest('hex');
+		const previousSubscriptions = pushSubscriptions;
+		pushSubscriptions = Object.assign(Object.create(null), pushSubscriptions);
+		for (const [registeredPlayerId, subscriptions] of Object.entries(pushSubscriptions)) {
+			const nextSubscriptions = Object.assign(Object.create(null), subscriptions);
+			for (const [id, existingSubscription] of Object.entries(nextSubscriptions)) {
+				if (existingSubscription.endpoint === subscription.endpoint) {
+					delete nextSubscriptions[id];
+				}
+			}
+			if (Object.keys(nextSubscriptions).length) pushSubscriptions[registeredPlayerId] = nextSubscriptions;
+			else delete pushSubscriptions[registeredPlayerId];
+		}
+		pushSubscriptions[playerId] = {
+			...(pushSubscriptions[playerId] || {}),
+			[subscriptionId]: subscription
+		};
+		if (!persistState()) {
+			pushSubscriptions = previousSubscriptions;
+			return reply({ ok: false, reason: 'persistence-unavailable' });
+		}
+		reply({ ok: true });
+	});
+
+	socket.on('remove-push-subscription', (payload, acknowledge) => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		const playerId = socket.data.playerId;
+		const endpoint = payload?.endpoint;
+		if (!playerId || typeof endpoint !== 'string') {
+			return reply({ ok: false, reason: 'invalid-subscription' });
+		}
+		const subscriptions = pushSubscriptions[playerId];
+		if (subscriptions) {
+			const previous = { ...subscriptions };
+			for (const [id, subscription] of Object.entries(subscriptions)) {
+				if (subscription.endpoint === endpoint) delete subscriptions[id];
+			}
+			if (Object.keys(subscriptions).length === 0) delete pushSubscriptions[playerId];
+			if (!persistState()) {
+				pushSubscriptions[playerId] = previous;
+				return reply({ ok: false, reason: 'persistence-unavailable' });
+			}
+		}
+		reply({ ok: true });
 	});
 
 	// Rehydration: client asks who am I with its auth
@@ -210,7 +291,7 @@ io.on('connection', socket => {
 	});
 
 	socket.on('start-game', payload => {
-		if (socket.handshake.query.role !== 'ADMIN') {
+		if (!socket.data.isAdmin) {
 			return socket.emit('start-error', { reason: 'unauthorized' });
 		}
 		if (isGameActive) {
@@ -349,7 +430,7 @@ io.on('connection', socket => {
 				labelSet.add(taskLabel);
 				assignedCountByTask[taskLabel] = (assignedCountByTask[taskLabel] || 0) + 1;
 
-				const taskId = uuid();
+				const taskId = crypto.randomUUID();
 				playerTasks[a][taskId] = taskLabel;
 				console.log('[assign-task]', { auth: a, taskId, taskLabel });
 				if (!impostorAuths.has(a)) {
@@ -406,23 +487,25 @@ io.on('connection', socket => {
 		lastMeetingType = 'report';
 		io.emit('play-meeting');
 		io.emit('meeting-started');
+		void notifyMeetingPlayers('Meeting called', 'Return to the game now.');
 		persistState();
 		console.log('[report]', { socketId: socket.id, auth: socketIdToAuth[socket.id] });
 	});
 
 	socket.on('emergency-meeting', () => {
-		if (!socket.data.playerId || !isGameActive || isMeeting) return;
+		if ((!socket.data.playerId && !socket.data.isAdmin) || !isGameActive || isMeeting) return;
 		if (Date.now() < emergencyCooldownEndMs) return;
 		isMeeting = true;
 		lastMeetingType = 'emergency';
 		io.emit('play-meeting');
 		io.emit('meeting-started');
+		void notifyMeetingPlayers('Emergency meeting', 'Return to the game now.');
 		persistState();
 		console.log('[emergency-meeting]', { socketId: socket.id, auth: socketIdToAuth[socket.id] });
 	});
 
 	socket.on('continue-game', () => {
-		if (socket.handshake.query.role !== 'ADMIN' || !isGameActive) return;
+		if (!socket.data.isAdmin || !isGameActive) return;
 		isMeeting = false;
 		// Reset kill cooldown for all impostors at the end of a meeting
 		const killMs = Math.max(0, (gameConfig.killCooldownSeconds || 0) * 1000);
@@ -447,7 +530,7 @@ io.on('connection', socket => {
 	});
 
 	socket.on('end-game', () => {
-		if (socket.handshake.query.role !== 'ADMIN' || !isGameActive) return;
+		if (!socket.data.isAdmin || !isGameActive) return;
 		isMeeting = false;
 		isGameActive = false;
 		emergencyCooldownEndMs = 0;
@@ -583,20 +666,21 @@ io.on('connection', socket => {
 	});
 });
 
-function getStateSnapshot() {
+function getStateSnapshot(includeAdminData) {
 	return {
 		isMeeting,
 		isGameActive,
 		emergencyCooldownEndMs,
-		config: gameConfig,
+		config: includeAdminData ? gameConfig : undefined,
 		sabotageEndMs,
 		sabotageChargesRemaining,
-		players: getConnectedPlayers()
+		players: includeAdminData ? getConnectedPlayers() : undefined
 	};
 }
 
 function sendPlayerSnapshot(socket, playerId) {
 	const info = authToPlayer[playerId];
+	if (info?.role === 'Impostor') impostorIds.add(socket.id);
 	if (info?.role) socket.emit('role', info.role);
 	if (info?.tasks) socket.emit('tasks', info.tasks);
 	socket.emit('tasks-completed', getCompletionMapForAuth(playerId));
@@ -619,6 +703,7 @@ function persistState() {
 		version: 1,
 		gameConfig,
 		playerDirectory,
+		pushSubscriptions,
 		authToPlayer,
 		taskProgress,
 		isMeeting,
@@ -635,8 +720,8 @@ function persistState() {
 	};
 	const temporaryFile = `${STATE_FILE}.tmp`;
 	try {
-		fs.mkdirSync(DATA_DIR, { recursive: true });
-		fs.writeFileSync(temporaryFile, JSON.stringify(snapshot), 'utf8');
+		fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+		fs.writeFileSync(temporaryFile, JSON.stringify(snapshot), { encoding: 'utf8', mode: 0o600 });
 		fs.renameSync(temporaryFile, STATE_FILE);
 		return true;
 	} catch (error) {
@@ -696,12 +781,20 @@ function loadPersistentState() {
 			)) {
 			throw new Error('Saved state contains invalid game settings');
 		}
+		if (saved.pushSubscriptions !== undefined &&
+			(!isRecord(saved.pushSubscriptions) ||
+				!Object.values(saved.pushSubscriptions).every(subscriptions =>
+					isRecord(subscriptions) && Object.values(subscriptions).every(isValidPushSubscription)
+				))) {
+			throw new Error('Saved state contains invalid push subscriptions');
+		}
 
 		if (saved.gameConfig && typeof saved.gameConfig === 'object') {
 			gameConfig = { ...gameConfig, ...saved.gameConfig };
 			if (!Array.isArray(gameConfig.tasks)) gameConfig.tasks = TASKS;
 		}
 		playerDirectory = Object.assign(Object.create(null), saved.playerDirectory);
+		pushSubscriptions = Object.assign(Object.create(null), saved.pushSubscriptions || {});
 		authToPlayer = Object.assign(Object.create(null), saved.authToPlayer);
 		if (saved.taskProgress && typeof saved.taskProgress === 'object') {
 			taskProgress = Object.assign(Object.create(null), saved.taskProgress);
@@ -734,6 +827,41 @@ function loadPersistentState() {
 
 function isRecord(value) {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isValidPushSubscription(subscription) {
+	if (!isRecord(subscription) || typeof subscription.endpoint !== 'string' ||
+		!isRecord(subscription.keys) || typeof subscription.keys.p256dh !== 'string' ||
+		typeof subscription.keys.auth !== 'string') {
+		return false;
+	}
+	try {
+		return new URL(subscription.endpoint).protocol === 'https:';
+	} catch {
+		return false;
+	}
+}
+
+async function notifyMeetingPlayers(title, body) {
+	if (!pushEnabled) return;
+	const notification = JSON.stringify({ title, body, url: '/' });
+	for (const [playerId, subscriptions] of Object.entries(pushSubscriptions)) {
+		for (const [subscriptionId, subscription] of Object.entries(subscriptions)) {
+			try {
+				await webPush.sendNotification(subscription, notification, { TTL: 120, urgency: 'high' });
+			} catch (error) {
+				if (error.statusCode === 404 || error.statusCode === 410) {
+					delete pushSubscriptions[playerId][subscriptionId];
+					if (Object.keys(pushSubscriptions[playerId]).length === 0) {
+						delete pushSubscriptions[playerId];
+					}
+					persistState();
+				} else {
+					console.error('[push] Unable to send meeting notification:', error);
+				}
+			}
+		}
+	}
 }
 
 function emitTaskProgress() {
@@ -778,7 +906,7 @@ function getConnectedPlayers() {
 function broadcastPlayersToAdmins() {
 	const players = getConnectedPlayers();
 	for (const socket of io.of('/').sockets.values()) {
-		if (socket.handshake.query.role === 'ADMIN') {
+		if (socket.data.isAdmin) {
 			socket.emit('players-updated', players);
 		}
 	}
