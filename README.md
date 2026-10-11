@@ -22,7 +22,7 @@ This was built for personal use, but anyone is welcome to use this for hosting t
 
 Manage game settings and task collections from the admin dashboard. Each collection can be used for a different location; task labels are assigned without duplicates for an individual player, and the per-task player cap is respected when the task pool allows it.
 
-Each collection can also have its own JPG, PNG, or WebP map (up to 10 MB), saved alongside persistent server data and shown to players during that collection's game. The admin dashboard shows global task completion across all players.
+Edit each collection's tasks and rooms inline in the admin table. The **Unsaved changes** indicator appears while edits are pending; use **Save task changes** above the table or **Save changes** below it to persist them. Starting a game also saves the collection first. Collections can also have their own JPG, PNG, or WebP map (up to 10 MB), saved alongside persistent server data and shown to players during that collection's game. The admin dashboard shows global task completion across all players.
 
 Players join by entering a name. Names are case-insensitive and must be unique while connected; the admin dashboard shows all players who have logged in and whether each is currently connected. Admins can remove saved players from the roster when a game is not active; removing a connected player also disconnects them. The roster, game settings, roles, task progress, and active round are saved in `DATA_DIR` (defaults to `data/`) and restored after a backend restart. Keep this directory on persistent storage when deploying; the provided Compose configuration mounts a named volume for it.
 
@@ -59,7 +59,7 @@ Hosting platforms with ephemeral disks (including free Render services) will los
 
 ### 3. Run locally without Docker
 
-Copy `.env.example` to `.env` in the repository root, then set `ADMIN_CODE`. Start the app with:
+Use Node.js 24 LTS. Copy `.env.example` to `.env` in the repository root, then set `ADMIN_CODE`. For development, run `npm run dev`; Vite serves the frontend with hot reload, and Node automatically restarts the backend when server files change. You do not need to build the frontend while developing. Start the production build with:
 
 ```
 $ npm ci
@@ -68,7 +68,7 @@ $ npm run build:web
 $ npm start
 ```
 
-The production server serves the built React app at `/` and `/admin`. During development, run `npm run dev`; Vite proxies game sockets and media to the backend.
+The production server serves the built React app at `/` and `/admin`.
 
 ### 4. Connect to the admin dashboard
 

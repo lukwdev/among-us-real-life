@@ -1,8 +1,269 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { Alert, Box, Button, Card, CardContent, Chip, Divider, FormControl, IconButton, InputLabel, LinearProgress, List, ListItem, ListItemText, MenuItem, Paper, Select, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material';
+import { Alert, Box, Button, Card, CardContent, Chip, Divider, FormControl, IconButton, InputLabel, LinearProgress, MenuItem, Paper, Select, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
+
+function splitTaskLabel(label) {
+    const match = /^(.*)\s+\(([^()]*)\)$/.exec(label);
+    return match ? { task: match[1], room: match[2] } : { task: label, room: '' };
+}
+
+function joinTaskLabel(task, room) {
+    return room ? `${task} (${room})` : task;
+}
+
+function TaskCollectionEditor({
+    taskCollections,
+    selectedTaskCollectionId,
+    selectTaskCollection,
+    collectionName,
+    setCollectionName,
+    tasks,
+    taskName,
+    setTaskName,
+    taskLocation,
+    setTaskLocation,
+    collectionsDirty,
+    isConnected,
+    mapUploadInProgress,
+    collectionError,
+    addCollection,
+    deleteCollection,
+    saveTaskCollections,
+    uploadCollectionMap,
+    removeCollectionMap,
+    updateSelectedCollectionTasks
+}) {
+    const selectedCollection = taskCollections.find((collection) => collection.id === selectedTaskCollectionId);
+
+    return (
+        <Card sx={{ width: '100%', minWidth: 0 }}>
+            <CardContent>
+                <Stack spacing={2}>
+                    <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'center' }} spacing={1}>
+                        <Box>
+                            <Typography variant="h6">Task collections</Typography>
+                            <Typography variant="body2" color="text.secondary">
+                                Edit task and room details directly. Save your changes before starting a game.
+                            </Typography>
+                        </Box>
+                        <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+                            <Chip
+                                size="small"
+                                color={collectionsDirty ? 'warning' : 'success'}
+                                label={collectionsDirty ? 'Unsaved changes' : 'All changes saved'}
+                            />
+                            <Button
+                                variant="contained"
+                                onClick={() => saveTaskCollections()}
+                                disabled={!isConnected || !collectionsDirty}
+                            >
+                                Save task changes
+                            </Button>
+                        </Stack>
+                    </Stack>
+
+                    <Stack direction={{ xs: 'column', md: 'row' }} spacing={1} alignItems={{ xs: 'stretch', md: 'center' }}>
+                        <FormControl fullWidth>
+                            <InputLabel id="task-collection-label">Collection</InputLabel>
+                            <Select
+                                labelId="task-collection-label"
+                                label="Collection"
+                                value={selectedTaskCollectionId}
+                                onChange={(event) => selectTaskCollection(event.target.value)}
+                            >
+                                {taskCollections.map((collection) => (
+                                    <MenuItem key={collection.id} value={collection.id}>
+                                        {collection.name} ({collection.tasks.length})
+                                    </MenuItem>
+                                ))}
+                            </Select>
+                        </FormControl>
+                        <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
+                            <Button color="error" variant="outlined" onClick={deleteCollection} disabled={!isConnected || taskCollections.length <= 1}>
+                                Delete
+                            </Button>
+                            <Button component="label" variant="outlined" disabled={!isConnected || mapUploadInProgress}>
+                                {mapUploadInProgress ? 'Saving map…' : 'Upload map'}
+                                <input
+                                    hidden
+                                    type="file"
+                                    accept="image/jpeg,image/png,image/webp"
+                                    onChange={(event) => {
+                                        uploadCollectionMap(event.target.files?.[0]);
+                                        event.target.value = '';
+                                    }}
+                                />
+                            </Button>
+                        </Stack>
+                    </Stack>
+
+                    <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems="stretch">
+                        <Box sx={{ flex: '1 1 0', minWidth: 0 }}>
+                            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                                <TextField
+                                    label="New collection name"
+                                    value={collectionName}
+                                    onChange={(event) => setCollectionName(event.target.value)}
+                                    inputProps={{ maxLength: 64 }}
+                                    fullWidth
+                                />
+                                <Button variant="outlined" onClick={addCollection} sx={{ flexShrink: 0 }}>Add collection</Button>
+                            </Stack>
+                        </Box>
+                        {selectedCollection && (
+                            <Paper variant="outlined" sx={{ p: 1.5, flex: '1 1 0', minWidth: 0 }}>
+                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} alignItems={{ xs: 'stretch', sm: 'center' }}>
+                                    <Box
+                                        component="img"
+                                        src={selectedCollection.mapUrl || '/images/MAP.JPG'}
+                                        alt={`${selectedCollection.name} map`}
+                                        sx={{
+                                            display: 'block',
+                                            width: { xs: '100%', sm: 180 },
+                                            height: 110,
+                                            objectFit: 'contain',
+                                            bgcolor: 'action.hover',
+                                            borderRadius: 1
+                                        }}
+                                        onError={(event) => {
+                                            event.currentTarget.style.display = 'none';
+                                        }}
+                                    />
+                                    <Stack spacing={0.5}>
+                                        <Typography variant="subtitle2">
+                                            {selectedCollection.mapUrl ? 'Collection map' : 'Default map'}
+                                        </Typography>
+                                        {selectedCollection.mapUrl && (
+                                            <Button
+                                                color="error"
+                                                size="small"
+                                                variant="text"
+                                                onClick={removeCollectionMap}
+                                                disabled={!isConnected || mapUploadInProgress}
+                                            >
+                                                Remove custom map
+                                            </Button>
+                                        )}
+                                    </Stack>
+                                </Stack>
+                            </Paper>
+                        )}
+                    </Stack>
+
+                    <Stack spacing={1}>
+                        <Typography variant="subtitle1">Add task</Typography>
+                        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                            <TextField label="Task" value={taskName} onChange={(event) => setTaskName(event.target.value)} fullWidth />
+                            <TextField label="Room (optional)" value={taskLocation} onChange={(event) => setTaskLocation(event.target.value)} fullWidth />
+                            <Button
+                                variant="contained"
+                                onClick={() => {
+                                    const name = taskName.trim();
+                                    const room = taskLocation.trim();
+                                    if (!name) return;
+                                    updateSelectedCollectionTasks((current) => [...current, joinTaskLabel(name, room)]);
+                                    setTaskName('');
+                                    setTaskLocation('');
+                                }}
+                                sx={{ minWidth: { sm: 100 } }}
+                            >
+                                Add task
+                            </Button>
+                        </Stack>
+                    </Stack>
+
+                    <TableContainer component={Paper} variant="outlined" sx={{ width: '100%', maxHeight: 'min(55vh, 560px)' }}>
+                        <Table size="small" stickyHeader aria-label="Editable task collection">
+                            <TableHead>
+                                <TableRow>
+                                    <TableCell sx={{ minWidth: 200, width: '60%' }}>Task</TableCell>
+                                    <TableCell sx={{ minWidth: 160, width: '35%' }}>Room</TableCell>
+                                    <TableCell align="right" sx={{ width: 56 }}>Actions</TableCell>
+                                </TableRow>
+                            </TableHead>
+                            <TableBody>
+                                {tasks.length === 0 ? (
+                                    <TableRow>
+                                        <TableCell colSpan={3} align="center">
+                                            <Typography variant="body2" color="text.secondary">No tasks yet. Add one above.</Typography>
+                                        </TableCell>
+                                    </TableRow>
+                                ) : tasks.map((label, idx) => {
+                                    const { task, room } = splitTaskLabel(label);
+                                    return (
+                                        <TableRow key={`${selectedTaskCollectionId}-${idx}`}>
+                                            <TableCell>
+                                                <TextField
+                                                    aria-label={`Task ${idx + 1}`}
+                                                    value={task}
+                                                    onChange={(event) => {
+                                                        const nextTask = event.target.value;
+                                                        updateSelectedCollectionTasks((current) => current.map((entry, entryIndex) =>
+                                                            entryIndex === idx ? joinTaskLabel(nextTask, room) : entry
+                                                        ));
+                                                    }}
+                                                    inputProps={{ maxLength: 200 }}
+                                                    variant="standard"
+                                                    fullWidth
+                                                />
+                                            </TableCell>
+                                            <TableCell>
+                                                <TextField
+                                                    aria-label={`Room for task ${idx + 1}`}
+                                                    value={room}
+                                                    onChange={(event) => {
+                                                        const nextRoom = event.target.value;
+                                                        updateSelectedCollectionTasks((current) => current.map((entry, entryIndex) =>
+                                                            entryIndex === idx ? joinTaskLabel(task, nextRoom) : entry
+                                                        ));
+                                                    }}
+                                                    inputProps={{ maxLength: 64 }}
+                                                    variant="standard"
+                                                    fullWidth
+                                                />
+                                            </TableCell>
+                                            <TableCell align="right">
+                                                <IconButton
+                                                    aria-label={`Delete task ${task}`}
+                                                    color="error"
+                                                    size="small"
+                                                    onClick={() => updateSelectedCollectionTasks((current) => current.filter((_, entryIndex) => entryIndex !== idx))}
+                                                >
+                                                    <DeleteIcon />
+                                                </IconButton>
+                                            </TableCell>
+                                        </TableRow>
+                                    );
+                                })}
+                            </TableBody>
+                        </Table>
+                    </TableContainer>
+
+                    <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'center' }} spacing={1}>
+                        <Typography variant="body2" color="text.secondary">
+                            {tasks.length} {tasks.length === 1 ? 'task' : 'tasks'} in this collection
+                        </Typography>
+                        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }}>
+                            <Typography variant="caption" color="text.secondary">
+                                {collectionsDirty ? 'Remember to save before leaving this page.' : 'Your collection changes are saved.'}
+                            </Typography>
+                            <Button
+                                variant="contained"
+                                onClick={() => saveTaskCollections()}
+                                disabled={!isConnected || !collectionsDirty}
+                            >
+                                Save changes
+                            </Button>
+                        </Stack>
+                    </Stack>
+                    {collectionError && <Alert severity="error">{collectionError}</Alert>}
+                </Stack>
+            </CardContent>
+        </Card>
+    );
+}
 
 export default function Admin() {
     const [authorized, setAuthorized] = useState(false);
@@ -34,6 +295,7 @@ export default function Admin() {
     const [taskLocation, setTaskLocation] = useState('');
     const [tasks, setTasks] = useState([]);
     const [taskCollections, setTaskCollections] = useState([]);
+    const [collectionsDirty, setCollectionsDirty] = useState(false);
     const [selectedTaskCollectionId, setSelectedTaskCollectionId] = useState('');
     const [collectionName, setCollectionName] = useState('');
     const [collectionError, setCollectionError] = useState('');
@@ -150,6 +412,7 @@ export default function Admin() {
             }
             if (Array.isArray(s?.taskCollections)) {
                 setTaskCollections(s.taskCollections);
+                setCollectionsDirty(false);
                 const selectedId = s.selectedTaskCollectionId || s.taskCollections[0]?.id || '';
                 setSelectedTaskCollectionId(selectedId);
                 const selected = s.taskCollections.find((collection) => collection.id === selectedId);
@@ -254,6 +517,7 @@ export default function Admin() {
             }
             setTaskCollections(response.collections);
             setSelectedTaskCollectionId(response.selectedTaskCollectionId);
+            setCollectionsDirty(false);
             onSaved?.(true);
         });
     }
@@ -358,6 +622,7 @@ export default function Admin() {
         }
         const collection = { id: crypto.randomUUID(), name, tasks: [] };
         setTaskCollections((current) => [...current, collection]);
+        setCollectionsDirty(true);
         setSelectedTaskCollectionId(collection.id);
         setTasks([]);
         setCollectionName('');
@@ -373,6 +638,7 @@ export default function Admin() {
         if (!collection || !window.confirm(`Delete the "${collection.name}" task collection?`)) return;
         const remaining = taskCollections.filter((item) => item.id !== selectedTaskCollectionId);
         setTaskCollections(remaining);
+        setCollectionsDirty(true);
         setSelectedTaskCollectionId(remaining[0].id);
         setTasks(remaining[0].tasks);
         setCollectionError('');
@@ -383,9 +649,19 @@ export default function Admin() {
         if (!selected) return;
         const nextTasks = update(selected.tasks);
         setTasks(nextTasks);
+        setCollectionsDirty(true);
         setTaskCollections((current) => current.map((collection) => collection.id === selectedTaskCollectionId
             ? { ...collection, tasks: nextTasks }
             : collection));
+        setCollectionError('');
+    }
+
+    function selectTaskCollection(collectionId) {
+        const selected = taskCollections.find((collection) => collection.id === collectionId);
+        if (!selected) return;
+        setSelectedTaskCollectionId(collectionId);
+        setTasks(selected.tasks);
+        setCollectionsDirty(true);
         setCollectionError('');
     }
 
@@ -503,7 +779,7 @@ export default function Admin() {
 
     return (
         <>
-            <Stack spacing={2} alignItems="stretch" sx={{ width: '100%', maxWidth: 1280, mx: 'auto', py: { xs: 1, sm: 3 }, px: { xs: 1, sm: 2 } }}>
+            <Stack spacing={2} alignItems="stretch" sx={{ width: '100%', maxWidth: 1600, mx: 'auto', py: { xs: 1, sm: 3 }, px: { xs: 0, sm: 1 } }}>
                 <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }} justifyContent="space-between">
                     <Stack direction="row" spacing={1} alignItems="center">
                         <Typography variant="h5">Admin dashboard</Typography>
@@ -531,8 +807,6 @@ export default function Admin() {
                 )}
                 {startError && <Alert severity="error">{startError}</Alert>}
                 {playerManagementMessage && <Alert severity="info">{playerManagementMessage}</Alert>}
-                {collectionError && <Alert severity="error">{collectionError}</Alert>}
-
                 <Card>
                     <CardContent>
                         <Stack spacing={1}>
@@ -557,7 +831,32 @@ export default function Admin() {
                     </CardContent>
                 </Card>
 
-                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', md: 'minmax(0, 1.2fr) minmax(360px, 0.8fr)' }, gap: 2, alignItems: 'start' }}>
+                {showStart && (
+                    <TaskCollectionEditor
+                        taskCollections={taskCollections}
+                        selectedTaskCollectionId={selectedTaskCollectionId}
+                        selectTaskCollection={selectTaskCollection}
+                        collectionName={collectionName}
+                        setCollectionName={setCollectionName}
+                        tasks={tasks}
+                        taskName={taskName}
+                        setTaskName={setTaskName}
+                        taskLocation={taskLocation}
+                        setTaskLocation={setTaskLocation}
+                        collectionsDirty={collectionsDirty}
+                        isConnected={isConnected}
+                        mapUploadInProgress={mapUploadInProgress}
+                        collectionError={collectionError}
+                        addCollection={addCollection}
+                        deleteCollection={deleteCollection}
+                        saveTaskCollections={saveTaskCollections}
+                        uploadCollectionMap={uploadCollectionMap}
+                        removeCollectionMap={removeCollectionMap}
+                        updateSelectedCollectionTasks={updateSelectedCollectionTasks}
+                    />
+                )}
+
+                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', md: 'minmax(0, 1.15fr) minmax(360px, 0.85fr)' }, gap: 2, alignItems: 'start' }}>
                 <Card sx={{ width: '100%', minWidth: 0 }}>
                     <CardContent>
                         <Typography variant="h6" gutterBottom>
@@ -642,146 +941,16 @@ export default function Admin() {
                         <Stack spacing={2} alignItems="stretch">
                             {showStart && (
                                 <>
-                                    <Typography variant="h6" alignSelf="flex-start">Task collections</Typography>
-                                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: '100%' }}>
-                                        <FormControl fullWidth>
-                                            <InputLabel id="task-collection-label">Collection</InputLabel>
-                                            <Select
-                                                labelId="task-collection-label"
-                                                label="Collection"
-                                                value={selectedTaskCollectionId}
-                                                onChange={(event) => {
-                                                    const selected = taskCollections.find((collection) => collection.id === event.target.value);
-                                                    setSelectedTaskCollectionId(event.target.value);
-                                                    setTasks(selected?.tasks || []);
-                                                    setCollectionError('');
-                                                }}
-                                            >
-                                                {taskCollections.map((collection) => (
-                                                    <MenuItem key={collection.id} value={collection.id}>
-                                                        {collection.name} ({collection.tasks.length})
-                                                    </MenuItem>
-                                                ))}
-                                            </Select>
-                                        </FormControl>
-                                        <Stack direction="row" spacing={1}>
-                                            <Button color="error" variant="outlined" onClick={deleteCollection} disabled={!isConnected || taskCollections.length <= 1}>
-                                                Delete
-                                            </Button>
-                                            <Button
-                                                component="label"
-                                                variant="outlined"
-                                                disabled={!isConnected || mapUploadInProgress}
-                                            >
-                                                {mapUploadInProgress ? 'Saving map…' : 'Upload map'}
-                                                <input
-                                                    hidden
-                                                    type="file"
-                                                    accept="image/jpeg,image/png,image/webp"
-                                                    onChange={(event) => {
-                                                        uploadCollectionMap(event.target.files?.[0]);
-                                                        event.target.value = '';
-                                                    }}
-                                                />
-                                            </Button>
-                                        </Stack>
-                                    </Stack>
-                                    {(() => {
-                                        const selectedCollection = taskCollections.find((collection) => collection.id === selectedTaskCollectionId);
-                                        if (!selectedCollection) return null;
-                                        return (
-                                            <Paper variant="outlined" sx={{ p: 1.5 }}>
-                                                <Stack spacing={1}>
-                                                    <Typography variant="subtitle2">
-                                                        {selectedCollection.mapUrl ? 'Collection map' : 'Default map'}
-                                                    </Typography>
-                                                    <Box
-                                                        component="img"
-                                                        src={selectedCollection.mapUrl || '/images/MAP.JPG'}
-                                                        alt={`${selectedCollection.name} map`}
-                                                        sx={{
-                                                            display: 'block',
-                                                            width: '100%',
-                                                            maxHeight: 240,
-                                                            objectFit: 'contain',
-                                                            bgcolor: 'action.hover',
-                                                            borderRadius: 1
-                                                        }}
-                                                        onError={(event) => {
-                                                            event.currentTarget.style.display = 'none';
-                                                        }}
-                                                    />
-                                                    {selectedCollection.mapUrl && (
-                                                        <Button
-                                                            color="error"
-                                                            size="small"
-                                                            variant="text"
-                                                            onClick={removeCollectionMap}
-                                                            disabled={!isConnected || mapUploadInProgress}
-                                                        >
-                                                            Remove custom map
-                                                        </Button>
-                                                    )}
-                                                </Stack>
-                                            </Paper>
-                                        );
-                                    })()}
-                                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: '100%' }}>
-                                        <TextField
-                                            label="New collection name"
-                                            value={collectionName}
-                                            onChange={(event) => setCollectionName(event.target.value)}
-                                            inputProps={{ maxLength: 64 }}
-                                            fullWidth
-                                        />
-                                        <Button variant="outlined" onClick={addCollection} sx={{ flexShrink: 0 }}>Add</Button>
-                                    </Stack>
-                                    <Button variant="outlined" onClick={() => saveTaskCollections()} disabled={!isConnected || !taskCollections.length}>
-                                        Save collections
-                                    </Button>
-                                    <Divider sx={{ width: '100%' }} />
-                                    <TextField label="Number of Impostors" value={numImpostors} onChange={(e) => setNumImpostors(e.target.value)} inputMode="numeric" fullWidth />
-                                    <TextField label="Tasks per Player" value={numTasksPerPlayer} onChange={(e) => setNumTasksPerPlayer(e.target.value)} inputMode="numeric" fullWidth />
-                                    <TextField label="Emergency Cooldown (minutes)" value={cooldownMinutes} onChange={(e) => setCooldownMinutes(e.target.value)} inputMode="decimal" fullWidth />
-                                    <TextField label="Kill Cooldown (seconds)" value={killCooldownSeconds} onChange={(e) => setKillCooldownSeconds(e.target.value)} inputMode="decimal" fullWidth />
-                                    <TextField label="Sabotage Duration (seconds)" value={sabotageSeconds} onChange={(e) => setSabotageSeconds(e.target.value)} inputMode="numeric" fullWidth />
-                                    <TextField label="Sabotage Charges (shared)" value={sabotageCharges} onChange={(e) => setSabotageCharges(e.target.value)} inputMode="numeric" fullWidth />
-                                    <TextField label="Max Players per Task" value={maxPlayersPerTask} onChange={(e) => setMaxPlayersPerTask(e.target.value)} inputMode="numeric" fullWidth />
-                                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
-                                        <TextField label="Task" value={taskName} onChange={(e) => setTaskName(e.target.value)} fullWidth />
-                                        <TextField label="Location (optional)" value={taskLocation} onChange={(e) => setTaskLocation(e.target.value)} fullWidth />
-                                        <Button variant="contained" onClick={() => {
-                                            const name = taskName.trim();
-                                            const loc = taskLocation.trim();
-                                            if (!name) return;
-                                            const label = loc ? `${name} (${loc})` : name;
-                                            updateSelectedCollectionTasks((current) => [...current, label]);
-                                            setTaskName('');
-                                            setTaskLocation('');
-                                        }} sx={{ minWidth: { sm: 80 } }}>Add task</Button>
-                                    </Stack>
-                                    <Paper variant="outlined" sx={{ width: '100%', maxHeight: 'min(40vh, 320px)', overflowY: 'auto' }}>
-                                        <List dense disablePadding>
-                                            {tasks.map((t, idx) => (
-                                                <ListItem
-                                                    key={`${selectedTaskCollectionId}-${idx}`}
-                                                    sx={{ borderBottom: idx < tasks.length - 1 ? 1 : 0, borderColor: 'divider' }}
-                                                    secondaryAction={
-                                                        <IconButton edge="end" aria-label={`Delete task ${t}`} onClick={() => updateSelectedCollectionTasks((current) => current.filter((_, i) => i !== idx))}>
-                                                            <DeleteIcon />
-                                                        </IconButton>
-                                                    }
-                                                >
-                                                    <ListItemText primary={t} sx={{ pr: 2, overflowWrap: 'anywhere' }} />
-                                                </ListItem>
-                                            ))}
-                                            {tasks.length === 0 && (
-                                                <ListItem>
-                                                    <ListItemText primary="No tasks yet. Add some above." />
-                                                </ListItem>
-                                            )}
-                                        </List>
-                                    </Paper>
+                                    <Typography variant="h6">Game settings</Typography>
+                                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', sm: 'repeat(2, minmax(0, 1fr))' }, gap: 1.5 }}>
+                                        <TextField label="Number of Impostors" value={numImpostors} onChange={(e) => setNumImpostors(e.target.value)} inputMode="numeric" fullWidth />
+                                        <TextField label="Tasks per Player" value={numTasksPerPlayer} onChange={(e) => setNumTasksPerPlayer(e.target.value)} inputMode="numeric" fullWidth />
+                                        <TextField label="Emergency Cooldown (minutes)" value={cooldownMinutes} onChange={(e) => setCooldownMinutes(e.target.value)} inputMode="decimal" fullWidth />
+                                        <TextField label="Kill Cooldown (seconds)" value={killCooldownSeconds} onChange={(e) => setKillCooldownSeconds(e.target.value)} inputMode="decimal" fullWidth />
+                                        <TextField label="Sabotage Duration (seconds)" value={sabotageSeconds} onChange={(e) => setSabotageSeconds(e.target.value)} inputMode="numeric" fullWidth />
+                                        <TextField label="Sabotage Charges (shared)" value={sabotageCharges} onChange={(e) => setSabotageCharges(e.target.value)} inputMode="numeric" fullWidth />
+                                        <TextField label="Max Players per Task" value={maxPlayersPerTask} onChange={(e) => setMaxPlayersPerTask(e.target.value)} inputMode="numeric" fullWidth />
+                                    </Box>
                                     <Button variant="contained" color="primary" size="large" id="start-game" onClick={startGameWithConfig} disabled={!isConnected || !selectedTaskCollectionId || !tasks.length}>
                                         Start Game · {taskCollections.find((collection) => collection.id === selectedTaskCollectionId)?.name || 'Select a collection'}
                                     </Button>

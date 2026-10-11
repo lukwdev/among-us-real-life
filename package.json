@@ -5,7 +5,7 @@
 	"main": "src/index.js",
 	"scripts": {
 		"start": "node src/index.js",
-		"dev:server": "node src/index.js",
+		"dev:server": "node --watch src/index.js",
 		"dev:web": "npm run dev --prefix web",
 		"dev": "concurrently -k -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
 		"build:web": "npm run build --prefix web",
