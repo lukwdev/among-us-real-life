@@ -29,6 +29,8 @@ Players join by entering a name. Names are case-insensitive and must be unique w
 
 Crewmates win when every assigned crew task is complete. Tasks belonging to a dead crewmate are automatically completed one at a time after the configured **Dead Player Task Interval**, which defaults to 90 seconds and can be changed in the admin game settings. Impostors win when the number of living impostors equals or exceeds the living crewmates; because eliminations are confirmed by players in this real-life game, a crewmate should use **Mark me as eliminated** after being eliminated. Either faction victory plays the win sound and shows a popup; opted-in push subscribers also receive a notification when their browser is in the background. The admin can then end the round before starting another.
 
+Impostors can activate sabotage using an available charge. The configured **Sabotage Duration** (60 seconds by default) starts a visible countdown and notification for all players. Any two different living players can press **Defuse sabotage**; if the timer expires first, the impostors win immediately. A successful defuse also sends a notification. The duration and shared sabotage charges can be changed in the admin game settings.
+
 ### 2. Deploy with Docker Compose
 
 The Compose setup builds the frontend and backend, keeps game data in a named volume, waits for the backend health check, and restarts crashed containers.

@@ -319,7 +319,7 @@ export default function Admin() {
     const [cooldownMinutes, setCooldownMinutes] = useState('0');
     const [killCooldownSeconds, setKillCooldownSeconds] = useState('0');
     const [maxPlayersPerTask, setMaxPlayersPerTask] = useState('2');
-    const [sabotageSeconds, setSabotageSeconds] = useState('20');
+    const [sabotageSeconds, setSabotageSeconds] = useState('60');
     const [sabotageCharges, setSabotageCharges] = useState('2');
     const [deadTaskCompletionIntervalSeconds, setDeadTaskCompletionIntervalSeconds] = useState('90');
     const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);

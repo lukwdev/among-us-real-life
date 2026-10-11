@@ -110,7 +110,7 @@ let gameConfig = {
 	// Max number of players that can receive the same task label
 	maxPlayersPerTask: 2,
 	// New: sabotage duration in seconds
-	sabotageDurationSeconds: 20,
+	sabotageDurationSeconds: 60,
 	// New: shared sabotage charges for all impostors
 	sabotageCharges: 2,
 	// Delay between automatic completion of tasks belonging to dead crewmates
@@ -131,6 +131,7 @@ let sabotageEndMs = 0;
 let sabotageTimeout = null;
 let sabotageUsedAuths = new Set();
 let sabotageChargesRemaining = 0;
+let sabotageDefuserAuths = new Set();
 
 let deadAuths = new Set();
 let deadTaskNextCompletionAtByAuth = Object.create(null);
@@ -610,6 +611,7 @@ io.on('connection', socket => {
 		isSabotageActive = false;
 		sabotageEndMs = 0;
 		sabotageUsedAuths = new Set();
+		sabotageDefuserAuths = new Set();
 		sabotageChargesRemaining = Math.max(0, Number(gameConfig.sabotageCharges || 0));
 		if (sabotageTimeout) {
 			clearTimeout(sabotageTimeout);
@@ -794,6 +796,7 @@ io.on('connection', socket => {
 		isSabotageActive = false;
 		sabotageEndMs = 0;
 		sabotageUsedAuths = new Set();
+		sabotageDefuserAuths = new Set();
 		if (sabotageTimeout) {
 			clearTimeout(sabotageTimeout);
 			sabotageTimeout = null;
@@ -843,24 +846,57 @@ io.on('connection', socket => {
 		if (isSabotageActive && sabotageEndMs > Date.now()) return;
 		if (sabotageChargesRemaining <= 0) return;
 		const durationMs = Math.max(0, (gameConfig.sabotageDurationSeconds || 0) * 1000);
+		if (durationMs <= 0) return;
 		const endMs = Date.now() + durationMs;
 		isSabotageActive = true;
 		sabotageEndMs = endMs;
+		sabotageDefuserAuths = new Set();
 		sabotageUsedAuths.add(a);
 		sabotageChargesRemaining = Math.max(0, sabotageChargesRemaining - 1);
 		io.emit('sabotage-started', { endMs });
 		io.emit('sabotage-charges', { remaining: sabotageChargesRemaining });
+		void sendPushNotification(
+			'Sabotage activated',
+			'Two players must press Defuse sabotage before the timer expires.',
+			'among-us-sabotage'
+		);
 		// Also inform this impostor they've used their sabotage
 		socket.emit('sabotage-usage', { used: true });
 		persistState();
 		if (sabotageTimeout) clearTimeout(sabotageTimeout);
 		sabotageTimeout = setTimeout(() => {
+			sabotageTimeout = null;
+			if (!isSabotageActive) return;
 			isSabotageActive = false;
 			sabotageEndMs = 0;
-			io.emit('sabotage-ended');
-			sabotageTimeout = null;
+			io.emit('sabotage-ended', { reason: 'timeout' });
 			persistState();
+			finishGame('impostors');
 		}, durationMs);
+	});
+
+	socket.on('defuse-sabotage', () => {
+		if (!socket.data.playerId || !isGameActive || !isSabotageActive) return;
+		const auth = socketIdToAuth[socket.id];
+		if (!auth || deadAuths.has(auth)) return;
+		if (sabotageDefuserAuths.has(auth)) return;
+		sabotageDefuserAuths.add(auth);
+		io.emit('sabotage-progress', { completed: sabotageDefuserAuths.size, required: 2 });
+		persistState();
+		if (sabotageDefuserAuths.size < 2) return;
+
+		isSabotageActive = false;
+		sabotageEndMs = 0;
+		if (sabotageTimeout) clearTimeout(sabotageTimeout);
+		sabotageTimeout = null;
+		io.emit('sabotage-ended', { reason: 'defused' });
+		void sendPushNotification(
+			'Sabotage defused',
+			'The sabotage was successfully defused by two players.',
+			'among-us-sabotage-defused'
+		);
+		persistState();
+		console.log('[sabotage-defused]', { auths: Array.from(sabotageDefuserAuths) });
 	});
 
 	socket.on('task-complete', taskId => {
@@ -1030,6 +1066,7 @@ function getStateSnapshot(includeAdminData) {
 		config: includeAdminData ? gameConfig : undefined,
 		sabotageEndMs,
 		sabotageChargesRemaining,
+		sabotageDefusedCount: sabotageDefuserAuths.size,
 		gameWinner,
 		playerJoinCode: includeAdminData && playerJoinCodeRequired ? playerJoinCode : undefined,
 		taskCollections: includeAdminData ? getTaskCollectionsSnapshot() : undefined,
@@ -1048,6 +1085,7 @@ function sendPlayerSnapshot(socket, playerId) {
 	socket.emit('sabotage-usage', { used: sabotageUsedAuths.has(playerId) });
 	if (isSabotageActive && sabotageEndMs > Date.now()) {
 		socket.emit('sabotage-started', { endMs: sabotageEndMs });
+		socket.emit('sabotage-progress', { completed: sabotageDefuserAuths.size, required: 2 });
 	}
 	const tasks = Object.values(taskProgress);
 	socket.emit('progress', tasks.length ? tasks.filter(Boolean).length / tasks.length : 0);
@@ -1082,6 +1120,7 @@ function persistState() {
 		isSabotageActive,
 		sabotageEndMs,
 		sabotageUsedAuths: Array.from(sabotageUsedAuths),
+		sabotageDefuserAuths: Array.from(sabotageDefuserAuths),
 		sabotageChargesRemaining,
 		gameWinner,
 		playerJoinCode
@@ -1110,13 +1149,18 @@ function loadPersistentState() {
 			!Array.isArray(saved.impostorAuths) ||
 			!Array.isArray(saved.deadAuths) ||
 			!Array.isArray(saved.sabotageUsedAuths) ||
+			(saved.sabotageDefuserAuths !== undefined && !Array.isArray(saved.sabotageDefuserAuths)) ||
 			!Array.isArray(saved.gameConfig.tasks) ||
 			!saved.gameConfig.tasks.every(task => typeof task === 'string') ||
 			!Object.entries(saved.playerDirectory).every(([id, player]) =>
 				isRecord(player) && player.id === id && typeof player.name === 'string' && player.name.trim()
 			) ||
 			!Object.values(saved.taskProgress).every(value => typeof value === 'boolean') ||
-			saved.impostorAuths.concat(saved.deadAuths, saved.sabotageUsedAuths).some(value => typeof value !== 'string')) {
+			saved.impostorAuths.concat(
+				saved.deadAuths,
+				saved.sabotageUsedAuths,
+				saved.sabotageDefuserAuths || []
+			).some(value => typeof value !== 'string')) {
 			throw new Error('Saved state contains invalid player or game data');
 		}
 		const numericConfigKeys = [
@@ -1226,6 +1270,7 @@ function loadPersistentState() {
 		isSabotageActive = saved.isSabotageActive === true && Number(saved.sabotageEndMs) > Date.now();
 		sabotageEndMs = isSabotageActive ? Number(saved.sabotageEndMs) : 0;
 		sabotageUsedAuths = new Set(Array.isArray(saved.sabotageUsedAuths) ? saved.sabotageUsedAuths : []);
+		sabotageDefuserAuths = new Set(Array.isArray(saved.sabotageDefuserAuths) ? saved.sabotageDefuserAuths : []);
 		sabotageChargesRemaining = Math.max(0, Number(saved.sabotageChargesRemaining) || 0);
 		gameWinner = ['crewmates', 'impostors'].includes(saved.gameWinner) ? saved.gameWinner : null;
 		if (playerJoinCodeRequired) {
@@ -1234,13 +1279,22 @@ function loadPersistentState() {
 				: playerJoinCode || generatePlayerJoinCode();
 		}
 		if (isSabotageActive) {
-			sabotageTimeout = setTimeout(() => {
+			const remainingMs = sabotageEndMs - Date.now();
+			if (remainingMs <= 0) {
 				isSabotageActive = false;
 				sabotageEndMs = 0;
-				io.emit('sabotage-ended');
-				sabotageTimeout = null;
-				persistState();
-			}, Math.max(0, sabotageEndMs - Date.now()));
+				finishGame('impostors');
+			} else {
+				sabotageTimeout = setTimeout(() => {
+					sabotageTimeout = null;
+					if (!isSabotageActive) return;
+					isSabotageActive = false;
+					sabotageEndMs = 0;
+					io.emit('sabotage-ended', { reason: 'timeout' });
+					persistState();
+					finishGame('impostors');
+				}, remainingMs);
+			}
 		}
 		if (isGameActive) {
 			for (const auth of deadAuths) scheduleDeadTaskCompletion(auth);

@@ -67,7 +67,9 @@ export default function Player() {
   const [mapUrl, setMapUrl] = useState('');
   const [audioReady, setAudioReady] = useState(false);
   const [sabotageEndMs, setSabotageEndMs] = useState(0);
-  const isSabotageActive = sabotageEndMs > Date.now();
+  const [sabotageRemainingMs, setSabotageRemainingMs] = useState(0);
+  const isSabotageActive = sabotageRemainingMs > 0;
+  const [sabotageDefusedCount, setSabotageDefusedCount] = useState(0);
   const [sabotageChargesRemaining, setSabotageChargesRemaining] = useState(0);
   // Stopwatch state
   const [stopwatchRunning, setStopwatchRunning] = useState(false);
@@ -186,6 +188,8 @@ export default function Player() {
       playerActionsRef.current.stopAllSounds();
       setHasUsedSabotage(false);
       setSabotageEndMs(0);
+      setSabotageRemainingMs(0);
+      setSabotageDefusedCount(0);
       setGameWinner(null);
       setIsDead(false);
       setGameActive(true);
@@ -194,6 +198,8 @@ export default function Player() {
       playerActionsRef.current.stopAllSounds();
       setHasUsedSabotage(false);
       setSabotageEndMs(0);
+      setSabotageRemainingMs(0);
+      setSabotageDefusedCount(0);
       setSabotageChargesRemaining(0);
       setGameActive(false);
       setIsDead(false);
@@ -207,15 +213,39 @@ export default function Player() {
       setGameWinner(['crewmates', 'impostors'].includes(s?.gameWinner) ? s.gameWinner : null);
       setMapUrl(typeof s?.mapUrl === 'string' ? s.mapUrl : '');
       if (typeof s?.sabotageChargesRemaining === 'number') setSabotageChargesRemaining(s.sabotageChargesRemaining);
+      if (typeof s?.sabotageDefusedCount === 'number') setSabotageDefusedCount(s.sabotageDefusedCount);
     });
     socket.on('player-dead', () => setIsDead(true));
     socket.on('sabotage-started', ({ endMs }) => {
       setSabotageEndMs(endMs || 0);
+      setSabotageRemainingMs(Math.max(0, (endMs || 0) - Date.now()));
       playerActionsRef.current.playLoop('/sounds/sabotage.mp3', endMs);
+      if ('Notification' in window && Notification.permission === 'granted' &&
+          !pushReadyRef.current && document.visibilityState === 'visible') {
+        new Notification('Sabotage activated', {
+          body: 'Two players must press Defuse sabotage before the timer expires.',
+          tag: 'among-us-sabotage',
+          icon: '/images/emergency-meeting.jpg'
+        });
+      }
     });
-    socket.on('sabotage-ended', () => {
+    socket.on('sabotage-ended', ({ reason } = {}) => {
       setSabotageEndMs(0);
+      setSabotageRemainingMs(0);
+      setSabotageDefusedCount(0);
       playerActionsRef.current.stopLoop();
+      if (reason === 'defused' &&
+          'Notification' in window && Notification.permission === 'granted' &&
+          !pushReadyRef.current && document.visibilityState === 'visible') {
+        new Notification('Sabotage defused', {
+          body: 'The sabotage was successfully defused by two players.',
+          tag: 'among-us-sabotage-defused',
+          icon: '/images/emergency-meeting.jpg'
+        });
+      }
+    });
+    socket.on('sabotage-progress', ({ completed }) => {
+      if (typeof completed === 'number') setSabotageDefusedCount(completed);
     });
     socket.on('sabotage-charges', ({ remaining }) => {
       setSabotageChargesRemaining(remaining || 0);
@@ -247,6 +277,17 @@ export default function Player() {
       socket.disconnect();
     };
   }, [playerName, loginAttempt]);
+
+  useEffect(() => {
+    if (!sabotageEndMs) {
+      setSabotageRemainingMs(0);
+      return undefined;
+    }
+    const updateRemaining = () => setSabotageRemainingMs(Math.max(0, sabotageEndMs - Date.now()));
+    updateRemaining();
+    const timer = window.setInterval(updateRemaining, 250);
+    return () => window.clearInterval(timer);
+  }, [sabotageEndMs]);
 
   async function syncPushSubscription(socket, publicKey, requestPermission = false) {
     try {
@@ -615,6 +656,7 @@ export default function Player() {
                 {Math.ceil(killCooldownRemainingMs / 1000)}s
               </Box>
             )}
+
           </Box>
         )}
         <Tooltip title="Open Map">
@@ -623,6 +665,46 @@ export default function Player() {
           </IconButton>
         </Tooltip>
       </Stack>
+
+      {isSabotageActive && (
+        <Alert
+          severity="error"
+          variant="filled"
+          sx={{
+            width: '100%',
+            maxWidth: 420,
+            boxSizing: 'border-box',
+            '& .MuiAlert-message': { width: '100%', minWidth: 0 }
+          }}
+        >
+          <Stack spacing={{ xs: 0.75, sm: 1 }} alignItems="center" sx={{ textAlign: 'center' }}>
+            <Typography
+              fontWeight={700}
+              sx={{ fontSize: { xs: '0.95rem', sm: '1rem' }, overflowWrap: 'anywhere' }}
+            >
+              SABOTAGE! Defuse it before time runs out.
+            </Typography>
+            <Typography sx={{ fontSize: { xs: '2rem', sm: '2.5rem' }, lineHeight: 1 }} fontWeight={800}>
+              {Math.ceil(sabotageRemainingMs / 1000)}s
+            </Typography>
+            <Typography variant="body2">
+              Players who have defused: {sabotageDefusedCount} / 2
+            </Typography>
+            {!isDead && (
+              <Button
+                variant="contained"
+                color="warning"
+                fullWidth
+                sx={{ maxWidth: 260, whiteSpace: 'normal' }}
+                disabled={sabotageDefusedCount >= 2}
+                onClick={() => socketRef.current?.emit('defuse-sabotage')}
+              >
+                Defuse sabotage
+              </Button>
+            )}
+          </Stack>
+        </Alert>
+      )}
 
       {isImpostor && (
         <Stack spacing={1} alignItems="center">
