@@ -489,10 +489,15 @@ export default function Player() {
 
   const hasTasks = Object.keys(tasks).length > 0;
   const [hasUsedSabotage, setHasUsedSabotage] = useState(false);
+  const playerIdentity = (
+    <Typography variant="subtitle2" color="text.secondary" sx={{ alignSelf: 'flex-start', px: 0.5, lineHeight: 1.2 }}>
+      {playerName}
+    </Typography>
+  );
 
   if (!playerName || loginError) {
     return (
-      <Stack component="form" spacing={2} alignItems="center" onSubmit={loginWithName} sx={{ width: '100%', py: 3 }}>
+      <Stack component="form" spacing={1.5} alignItems="center" onSubmit={loginWithName} sx={{ width: '100%', py: 1 }}>
         <Card sx={{ width: '100%', maxWidth: 420 }}>
           <CardContent>
             <Stack spacing={2}>
@@ -528,8 +533,8 @@ export default function Player() {
 
   if (!gameActive) {
     return (
-      <Stack spacing={2} alignItems="center" sx={{ width: '100%' }}>
-        <Typography variant="overline">Player ({playerName})</Typography>
+      <Stack spacing={1} alignItems="center" sx={{ width: '100%' }}>
+        {playerIdentity}
         {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
         {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
         {isConnected && pushEnabled && !pushSubscriptionSaved && (
@@ -564,8 +569,8 @@ export default function Player() {
 
   if (gameActive && !hasTasks) {
     return (
-      <Stack spacing={2} alignItems="center" sx={{ width: '100%' }}>
-        <Typography variant="overline">Player ({playerName})</Typography>
+      <Stack spacing={1} alignItems="center" sx={{ width: '100%' }}>
+        {playerIdentity}
         {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
         {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
         {isConnected && pushEnabled && !pushSubscriptionSaved && (
@@ -585,8 +590,8 @@ export default function Player() {
   }
 
   return (
-    <Stack spacing={2} alignItems="center" sx={{ width: '100%' }}>
-      <Typography variant="overline">Player ({playerName})</Typography>
+    <Stack spacing={1} alignItems="center" sx={{ width: '100%' }}>
+      {playerIdentity}
       {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
       {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
       {isConnected && pushEnabled && !pushSubscriptionSaved && (

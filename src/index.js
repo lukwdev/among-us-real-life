@@ -112,7 +112,9 @@ let gameConfig = {
 	// New: sabotage duration in seconds
 	sabotageDurationSeconds: 20,
 	// New: shared sabotage charges for all impostors
-	sabotageCharges: 2
+	sabotageCharges: 2,
+	// Delay between automatic completion of tasks belonging to dead crewmates
+	deadTaskCompletionIntervalSeconds: 90
 };
 let emergencyCooldownEndMs = 0;
 let lastMeetingType = null; // 'emergency' | 'report' | null
@@ -131,6 +133,8 @@ let sabotageUsedAuths = new Set();
 let sabotageChargesRemaining = 0;
 
 let deadAuths = new Set();
+let deadTaskNextCompletionAtByAuth = Object.create(null);
+const deadTaskCompletionTimers = new Map();
 let gameWinner = null;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const STATE_FILE = path.join(DATA_DIR, 'game-state.json');
@@ -559,6 +563,10 @@ io.on('connection', socket => {
 			if (typeof payload.sabotageCharges === 'number' && payload.sabotageCharges >= 0) {
 				gameConfig.sabotageCharges = payload.sabotageCharges;
 			}
+			if (typeof payload.deadTaskCompletionIntervalSeconds === 'number' &&
+				payload.deadTaskCompletionIntervalSeconds > 0) {
+				gameConfig.deadTaskCompletionIntervalSeconds = payload.deadTaskCompletionIntervalSeconds;
+			}
 		}
 		selectedTaskCollectionId = selectedCollection?.id || requestedCollectionId;
 		console.log('[start-game] config', gameConfig);
@@ -596,6 +604,8 @@ io.on('connection', socket => {
 		killCooldownEndMsBySocketId = {};
         //Reset dead players
         deadAuths = new Set();
+		deadTaskNextCompletionAtByAuth = Object.create(null);
+		clearDeadTaskCompletionTimers();
 		// Reset sabotage state
 		isSabotageActive = false;
 		sabotageEndMs = 0;
@@ -778,6 +788,8 @@ io.on('connection', socket => {
 		killCooldownEndMsByAuth = Object.create(null);
         // Reset dead players
         deadAuths = new Set();
+		deadTaskNextCompletionAtByAuth = Object.create(null);
+		clearDeadTaskCompletionTimers();
 		// Clear sabotage
 		isSabotageActive = false;
 		sabotageEndMs = 0;
@@ -891,6 +903,9 @@ io.on('connection', socket => {
         if (impostorAuths.has(auth)) return;
 
         deadAuths.add(auth);
+		deadTaskNextCompletionAtByAuth[auth] = Date.now() +
+			Math.max(1, Number(gameConfig.deadTaskCompletionIntervalSeconds || 90)) * 1000;
+		scheduleDeadTaskCompletion(auth);
 		persistState();
         console.log('[mark-dead]', { socketId: socket.id, auth });
 
@@ -921,6 +936,7 @@ io.on('connection', socket => {
 
 function finishGame(winner) {
 	if (!isGameActive || gameWinner || !['crewmates', 'impostors'].includes(winner)) return;
+	clearDeadTaskCompletionTimers();
 	gameWinner = winner;
 	isGameActive = false;
 	isMeeting = false;
@@ -946,6 +962,63 @@ function generatePlayerJoinCode() {
 		code += alphabet[crypto.randomInt(alphabet.length)];
 	}
 	return code;
+}
+
+function clearDeadTaskCompletionTimers() {
+	for (const timer of deadTaskCompletionTimers.values()) clearTimeout(timer);
+	deadTaskCompletionTimers.clear();
+}
+
+function scheduleDeadTaskCompletion(auth) {
+	if (deadTaskCompletionTimers.has(auth) ||
+		!isGameActive ||
+		!deadAuths.has(auth) ||
+		impostorAuths.has(auth)) return;
+
+	const taskIds = Object.keys(authToPlayer[auth]?.tasks || {});
+	const remainingTaskIds = taskIds.filter(taskId => taskProgress[taskId] === false);
+	if (remainingTaskIds.length === 0) {
+		delete deadTaskNextCompletionAtByAuth[auth];
+		return;
+	}
+
+	const intervalMs = Math.max(1, Number(gameConfig.deadTaskCompletionIntervalSeconds || 90)) * 1000;
+	const nextAt = Number.isFinite(deadTaskNextCompletionAtByAuth[auth])
+		? deadTaskNextCompletionAtByAuth[auth]
+		: Date.now() + intervalMs;
+	deadTaskNextCompletionAtByAuth[auth] = nextAt;
+	const timer = setTimeout(() => {
+		deadTaskCompletionTimers.delete(auth);
+		const nextTaskId = Object.keys(authToPlayer[auth]?.tasks || {})
+			.find(taskId => taskProgress[taskId] === false);
+		if (!isGameActive || !deadAuths.has(auth) || !nextTaskId) {
+			delete deadTaskNextCompletionAtByAuth[auth];
+			persistState();
+			return;
+		}
+
+		taskProgress[nextTaskId] = true;
+		delete deadTaskNextCompletionAtByAuth[auth];
+		emitTaskProgress();
+		persistState();
+		console.log('[dead-task-complete]', { auth, taskId: nextTaskId });
+
+		const playerSocket = Array.from(io.of('/').sockets.values())
+			.find(socket => socket.data.playerId === auth);
+		if (playerSocket) playerSocket.emit('tasks-completed', getCompletionMapForAuth(auth));
+
+		const progress = getGlobalProgress();
+		if (progress.total > 0 && progress.completed === progress.total) {
+			finishGame('crewmates');
+			return;
+		}
+		if (isGameActive) {
+			deadTaskNextCompletionAtByAuth[auth] = Date.now() + intervalMs;
+			scheduleDeadTaskCompletion(auth);
+			persistState();
+		}
+	}, Math.max(0, nextAt - Date.now()));
+	deadTaskCompletionTimers.set(auth, timer);
 }
 
 function getStateSnapshot(includeAdminData) {
@@ -1005,6 +1078,7 @@ function persistState() {
 		impostorAuths: Array.from(impostorAuths),
 		killCooldownEndMsByAuth,
 		deadAuths: Array.from(deadAuths),
+		deadTaskNextCompletionAtByAuth,
 		isSabotageActive,
 		sabotageEndMs,
 		sabotageUsedAuths: Array.from(sabotageUsedAuths),
@@ -1052,9 +1126,14 @@ function loadPersistentState() {
 			'killCooldownSeconds',
 			'maxPlayersPerTask',
 			'sabotageDurationSeconds',
-			'sabotageCharges'
+			'sabotageCharges',
+			'deadTaskCompletionIntervalSeconds'
 		];
-		if (numericConfigKeys.some(key => !Number.isFinite(saved.gameConfig[key]) || saved.gameConfig[key] < 0) ||
+		if (numericConfigKeys.some(key =>
+			saved.gameConfig[key] !== undefined &&
+			(!Number.isFinite(saved.gameConfig[key]) || saved.gameConfig[key] < 0)) ||
+			(saved.gameConfig.deadTaskCompletionIntervalSeconds !== undefined &&
+				saved.gameConfig.deadTaskCompletionIntervalSeconds <= 0) ||
 			!Number.isFinite(saved.emergencyCooldownEndMs) ||
 			!Number.isFinite(saved.sabotageEndMs) ||
 			!Number.isFinite(saved.sabotageChargesRemaining) ||
@@ -1062,6 +1141,9 @@ function loadPersistentState() {
 				!['crewmates', 'impostors'].includes(saved.gameWinner)) ||
 			(saved.playerJoinCode !== undefined && saved.playerJoinCode !== null &&
 				(typeof saved.playerJoinCode !== 'string' || !saved.playerJoinCode.trim())) ||
+			(saved.deadTaskNextCompletionAtByAuth !== undefined &&
+				(!isRecord(saved.deadTaskNextCompletionAtByAuth) ||
+					!Object.values(saved.deadTaskNextCompletionAtByAuth).every(Number.isFinite))) ||
 			!Object.values(saved.killCooldownEndMsByAuth).every(Number.isFinite) ||
 			!Object.values(saved.authToPlayer).every(player =>
 				isRecord(player) && typeof player.role === 'string' && isRecord(player.tasks)
@@ -1137,6 +1219,10 @@ function loadPersistentState() {
 		impostorAuths = new Set(Array.isArray(saved.impostorAuths) ? saved.impostorAuths : []);
 		killCooldownEndMsByAuth = Object.assign(Object.create(null), saved.killCooldownEndMsByAuth);
 		deadAuths = new Set(Array.isArray(saved.deadAuths) ? saved.deadAuths : []);
+		deadTaskNextCompletionAtByAuth = Object.assign(
+			Object.create(null),
+			saved.deadTaskNextCompletionAtByAuth || {}
+		);
 		isSabotageActive = saved.isSabotageActive === true && Number(saved.sabotageEndMs) > Date.now();
 		sabotageEndMs = isSabotageActive ? Number(saved.sabotageEndMs) : 0;
 		sabotageUsedAuths = new Set(Array.isArray(saved.sabotageUsedAuths) ? saved.sabotageUsedAuths : []);
@@ -1155,6 +1241,9 @@ function loadPersistentState() {
 				sabotageTimeout = null;
 				persistState();
 			}, Math.max(0, sabotageEndMs - Date.now()));
+		}
+		if (isGameActive) {
+			for (const auth of deadAuths) scheduleDeadTaskCompletion(auth);
 		}
 		if (playerJoinCodeRequired && saved.playerJoinCode !== playerJoinCode) {
 			persistState();

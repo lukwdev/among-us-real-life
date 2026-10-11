@@ -321,6 +321,7 @@ export default function Admin() {
     const [maxPlayersPerTask, setMaxPlayersPerTask] = useState('2');
     const [sabotageSeconds, setSabotageSeconds] = useState('20');
     const [sabotageCharges, setSabotageCharges] = useState('2');
+    const [deadTaskCompletionIntervalSeconds, setDeadTaskCompletionIntervalSeconds] = useState('90');
     const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
     const [connectedPlayers, setConnectedPlayers] = useState([]);
     const [startError, setStartError] = useState('');
@@ -431,6 +432,9 @@ export default function Admin() {
                 if (typeof s.config.maxPlayersPerTask === 'number') setMaxPlayersPerTask(String(s.config.maxPlayersPerTask));
                 if (typeof s.config.sabotageDurationSeconds === 'number') setSabotageSeconds(String(s.config.sabotageDurationSeconds));
                 if (typeof s.config.sabotageCharges === 'number') setSabotageCharges(String(s.config.sabotageCharges));
+                if (typeof s.config.deadTaskCompletionIntervalSeconds === 'number') {
+                    setDeadTaskCompletionIntervalSeconds(String(s.config.deadTaskCompletionIntervalSeconds));
+                }
             }
             if (Array.isArray(s?.taskCollections)) {
                 setTaskCollections(s.taskCollections);
@@ -510,7 +514,10 @@ export default function Admin() {
             killCooldownSeconds: Number.isFinite(parseFloat(killCooldownSeconds)) ? parseFloat(killCooldownSeconds) : 0,
             maxPlayersPerTask: Number.isFinite(parseInt(maxPlayersPerTask, 10)) ? parseInt(maxPlayersPerTask, 10) : undefined,
             sabotageDurationSeconds: Number.isFinite(parseInt(sabotageSeconds, 10)) ? parseInt(sabotageSeconds, 10) : undefined,
-            sabotageCharges: Number.isFinite(parseInt(sabotageCharges, 10)) ? parseInt(sabotageCharges, 10) : undefined
+            sabotageCharges: Number.isFinite(parseInt(sabotageCharges, 10)) ? parseInt(sabotageCharges, 10) : undefined,
+            deadTaskCompletionIntervalSeconds: Number.isFinite(parseInt(deadTaskCompletionIntervalSeconds, 10))
+                ? parseInt(deadTaskCompletionIntervalSeconds, 10)
+                : undefined
         };
         saveTaskCollections((saved) => {
             if (!saved) return;
@@ -1048,6 +1055,15 @@ export default function Admin() {
                                         <TextField label="Sabotage Duration (seconds)" value={sabotageSeconds} onChange={(e) => setSabotageSeconds(e.target.value)} inputMode="numeric" fullWidth />
                                         <TextField label="Sabotage Charges (shared)" value={sabotageCharges} onChange={(e) => setSabotageCharges(e.target.value)} inputMode="numeric" fullWidth />
                                         <TextField label="Max Players per Task" value={maxPlayersPerTask} onChange={(e) => setMaxPlayersPerTask(e.target.value)} inputMode="numeric" fullWidth />
+                                        <TextField
+                                            label="Dead Player Task Interval (seconds)"
+                                            value={deadTaskCompletionIntervalSeconds}
+                                            onChange={(e) => setDeadTaskCompletionIntervalSeconds(e.target.value)}
+                                            inputMode="numeric"
+                                            inputProps={{ min: 1 }}
+                                            helperText="One unfinished task from a dead crewmate is completed after each interval."
+                                            fullWidth
+                                        />
                                     </Box>
                                     <Button variant="contained" color="primary" size="large" id="start-game" onClick={startGameWithConfig} disabled={!isConnected || !selectedTaskCollectionId || !tasks.length}>
                                         Start Game · {taskCollections.find((collection) => collection.id === selectedTaskCollectionId)?.name || 'Select a collection'}

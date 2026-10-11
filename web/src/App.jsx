@@ -22,13 +22,13 @@ function AppContent() {
 
   return (
     <>
-      <Header />
+      {isAdmin && <Header />}
       <Box sx={{
-        py: { xs: 1, sm: 3 },
+        py: isAdmin ? { xs: 1, sm: 3 } : { xs: 0.5, sm: 2 },
         display: 'flex',
         justifyContent: 'center',
         alignItems: isAdmin ? 'flex-start' : 'center',
-        minHeight: 'calc(100vh - 64px)'
+        minHeight: isAdmin ? 'calc(100vh - 64px)' : '100vh'
       }}>
         <Container
           maxWidth={isAdmin ? false : 'sm'}
