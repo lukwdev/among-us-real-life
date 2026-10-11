@@ -7,6 +7,7 @@ I hacked together this small little web app for facilitating a game of Among Us 
 -   Assign impostors/crewmates
 -   Assign tasks
 -   Checking off tasks updates a global progress bar in real-time
+-   Automatically announce crew task victories and impostor parity victories
 
 Audio recordings from [https://www.voicy.network/pages/among-us](https://www.voicy.network/pages/among-us)
 
@@ -26,6 +27,8 @@ Edit each collection's tasks and rooms inline in the admin table. The **Unsaved 
 
 Players join by entering a name. Names are case-insensitive and must be unique while connected; the admin dashboard shows all players who have logged in and whether each is currently connected. Admins can remove saved players from the roster when a game is not active; removing a connected player also disconnects them. The roster, game settings, roles, task progress, and active round are saved in `DATA_DIR` (defaults to `data/`) and restored after a backend restart. Keep this directory on persistent storage when deploying; the provided Compose configuration mounts a named volume for it.
 
+Crewmates win when every assigned crew task is complete. Impostors win when the number of living impostors equals or exceeds the living crewmates; because eliminations are confirmed by players in this real-life game, a crewmate should use **Mark me as eliminated** after being eliminated. Either faction victory plays the win sound and shows a popup; opted-in push subscribers also receive a notification when their browser is in the background. The admin can then end the round before starting another.
+
 ### 2. Deploy with Docker Compose
 
 The Compose setup builds the frontend and backend, keeps game data in a named volume, waits for the backend health check, and restarts crashed containers.
@@ -36,7 +39,7 @@ cp .env.example .env
 
 Set a strong, private `ADMIN_CODE` in the **repository-root** `.env` file. The admin code is a server setting, not a Vite/frontend setting: do not put it in `web/.env` or name it `VITE_ADMIN_CODE`. Direct `npm start` and Docker Compose both load the root `.env`; Compose refuses to start if `ADMIN_CODE` is missing.
 
-For background meeting notifications, generate a VAPID key pair with `npx web-push generate-vapid-keys` and set both `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` in the root `.env`; leave both empty to disable push notifications. Set `PUSH_SUBJECT` to a contact email or an HTTPS URL. Keep the private key and `.env` out of source control.
+For background meeting and game-win notifications, generate a VAPID key pair with `npx web-push generate-vapid-keys` and set both `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` in the root `.env`; leave both empty to disable push notifications. Set `PUSH_SUBJECT` to a contact email or an HTTPS URL. Keep the private key and `.env` out of source control.
 
 ```sh
 docker compose up --build -d
@@ -54,8 +57,9 @@ Hosting platforms with ephemeral disks (including free Render services) will los
 - `src/index.js` wires configuration, HTTP, Socket.IO, and game lifecycle events.
 - `src/json-store.js` handles JSON reads and atomic writes for durable game state.
 - `src/collection-map-router.js` validates, persists, and serves collection map uploads.
-- `src/push-notifications.js` sends meeting alerts and prunes expired subscriptions.
-- `src/game-progress.js` calculates and broadcasts global task progress and the completion sound.
+- `src/push-notifications.js` sends meeting and game-win alerts and prunes expired subscriptions.
+- `src/game-progress.js` calculates and broadcasts global task progress.
+- `src/game-outcome.js` determines whether impostors have reached parity with the living crew.
 
 ### 3. Run locally without Docker
 

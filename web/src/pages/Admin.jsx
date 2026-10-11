@@ -1,8 +1,9 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { Alert, Box, Button, Card, CardContent, Chip, Divider, FormControl, IconButton, InputLabel, LinearProgress, MenuItem, Paper, Select, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material';
+import { Accordion, AccordionDetails, AccordionSummary, Alert, Box, Button, Card, CardContent, Chip, Divider, FormControl, IconButton, InputLabel, LinearProgress, MenuItem, Paper, Select, Snackbar, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 
 function splitTaskLabel(label) {
     const match = /^(.*)\s+\(([^()]*)\)$/.exec(label);
@@ -38,12 +39,26 @@ function TaskCollectionEditor({
     const selectedCollection = taskCollections.find((collection) => collection.id === selectedTaskCollectionId);
 
     return (
-        <Card sx={{ width: '100%', minWidth: 0 }}>
-            <CardContent>
+        <Accordion sx={{ width: '100%', minWidth: 0 }}>
+            <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={{ xs: 0.5, sm: 1.5 }} alignItems={{ xs: 'flex-start', sm: 'center' }}>
+                    <Typography variant="h6">Task collections</Typography>
+                    {selectedCollection && (
+                        <Typography variant="body2" color="text.secondary">
+                            {selectedCollection.name}
+                        </Typography>
+                    )}
+                    <Chip
+                        size="small"
+                        color={collectionsDirty ? 'warning' : 'success'}
+                        label={collectionsDirty ? 'Unsaved changes' : `${tasks.length} ${tasks.length === 1 ? 'task' : 'tasks'}`}
+                    />
+                </Stack>
+            </AccordionSummary>
+            <AccordionDetails sx={{ pt: 0 }}>
                 <Stack spacing={2}>
                     <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'center' }} spacing={1}>
                         <Box>
-                            <Typography variant="h6">Task collections</Typography>
                             <Typography variant="body2" color="text.secondary">
                                 Edit task and room details directly. Save your changes before starting a game.
                             </Typography>
@@ -260,8 +275,8 @@ function TaskCollectionEditor({
                     </Stack>
                     {collectionError && <Alert severity="error">{collectionError}</Alert>}
                 </Stack>
-            </CardContent>
-        </Card>
+            </AccordionDetails>
+        </Accordion>
     );
 }
 
@@ -289,6 +304,7 @@ export default function Admin() {
     const socketRef = useRef(null);
     const [meeting, setMeeting] = useState(false);
     const [gameActive, setGameActive] = useState(false);
+    const [gameWinner, setGameWinner] = useState(null);
     const [numImpostors, setNumImpostors] = useState('1');
     const [numTasksPerPlayer, setNumTasksPerPlayer] = useState('5');
     const [taskName, setTaskName] = useState('');
@@ -394,9 +410,13 @@ export default function Admin() {
         socket.on('meeting-ended', () => setMeeting(false));
         socket.on('game-started', () => setGameActive(true));
         socket.on('game-ended', () => { setGameActive(false); setMeeting(false); setCooldownRemainingMs(0); });
+        socket.on('game-won', (result) => {
+            if (['crewmates', 'impostors'].includes(result?.winner)) setGameWinner(result.winner);
+        });
         socket.on('state', (s) => {
             setMeeting(!!s?.isMeeting);
             setGameActive(!!s?.isGameActive);
+            setGameWinner(['crewmates', 'impostors'].includes(s?.gameWinner) ? s.gameWinner : null);
             if (typeof s?.emergencyCooldownEndMs === 'number') {
                 const remaining = s.emergencyCooldownEndMs - Date.now();
                 setCooldownRemainingMs(Math.max(0, remaining));
@@ -791,8 +811,8 @@ export default function Admin() {
                     </Stack>
                     <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
                         <Chip
-                            color={meeting ? 'error' : gameActive ? 'primary' : 'default'}
-                            label={meeting ? 'Meeting in progress' : gameActive ? 'Game in progress' : 'Game not started'}
+                            color={meeting ? 'error' : gameWinner === 'crewmates' ? 'success' : gameWinner === 'impostors' ? 'error' : gameActive ? 'primary' : 'default'}
+                            label={meeting ? 'Meeting in progress' : gameActive ? 'Game in progress' : gameWinner ? `${gameWinner === 'crewmates' ? 'Crewmates' : 'Impostors'} won` : 'Game not started'}
                         />
                         <Button size="small" variant="outlined" onClick={logout} disabled={!isConnected}>Log out</Button>
                     </Stack>
@@ -967,7 +987,7 @@ export default function Admin() {
                                     <Button variant="contained" onClick={continueGame} disabled={!isConnected}>Continue</Button>
                                 </>
                             )}
-                            {gameActive && (
+                            {(gameActive || gameWinner) && (
                                 <Button variant="outlined" color="error" onClick={endGame} disabled={!isConnected}>End Game</Button>
                             )}
                         </Stack>
@@ -975,6 +995,20 @@ export default function Admin() {
                 </Card>
                 </Box>
             </Stack>
+            <Snackbar
+                open={!!gameWinner}
+                autoHideDuration={6000}
+                onClose={() => setGameWinner(null)}
+                anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
+            >
+                <Alert
+                    onClose={() => setGameWinner(null)}
+                    severity={gameWinner === 'crewmates' ? 'success' : 'error'}
+                    variant="filled"
+                >
+                    {gameWinner === 'crewmates' ? 'Crewmates' : 'Impostors'} win!
+                </Alert>
+            </Snackbar>
         </>
     );
 }

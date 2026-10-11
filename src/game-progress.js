@@ -9,13 +9,10 @@ function createGameProgress({ io, getTaskProgress }) {
 		};
 	}
 
-	function emitTaskProgress({ announceWin = false } = {}) {
+	function emitTaskProgress() {
 		const progress = getGlobalProgress();
 		io.emit('progress', progress.ratio);
 		io.emit('global-progress', progress);
-		if (announceWin && progress.total > 0 && progress.completed === progress.total) {
-			io.emit('play-win');
-		}
 		console.log('[progress]', progress);
 	}
 

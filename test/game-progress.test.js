@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createGameProgress } = require('../src/game-progress');
 
-test('publishes global task progress and announces a newly completed game', () => {
+test('publishes global task progress without announcing a faction win', () => {
 	const emitted = [];
 	let taskProgress = { first: false, second: false };
 	const progress = createGameProgress({
@@ -17,11 +17,10 @@ test('publishes global task progress and announces a newly completed game', () =
 	]);
 
 	taskProgress = { first: true, second: true };
-	progress.emitTaskProgress({ announceWin: true });
+	progress.emitTaskProgress();
 	assert.deepEqual(emitted.slice(2), [
 		['progress', 1],
-		['global-progress', { completed: 2, total: 2, ratio: 1 }],
-		['play-win']
+		['global-progress', { completed: 2, total: 2, ratio: 1 }]
 	]);
 });
 
@@ -32,7 +31,7 @@ test('does not announce a win for an empty task set', () => {
 		getTaskProgress: () => ({})
 	});
 
-	progress.emitTaskProgress({ announceWin: true });
+	progress.emitTaskProgress();
 
 	assert.deepEqual(emitted, [
 		['progress', 0],

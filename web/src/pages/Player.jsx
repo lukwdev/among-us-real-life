@@ -1,7 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { Alert, Backdrop, Box, Button, Card, CardContent, Checkbox, FormControlLabel, IconButton, LinearProgress, List, ListItem, ListItemText, Stack, TextField, Tooltip, Typography, Dialog, DialogContent } from '@mui/material';
+import { Alert, Backdrop, Box, Button, Card, CardContent, Checkbox, FormControlLabel, IconButton, LinearProgress, List, ListItem, ListItemText, Snackbar, Stack, TextField, Tooltip, Typography, Dialog, DialogContent } from '@mui/material';
 import MapIcon from '@mui/icons-material/Map';
+
+function WinnerSnackbar({ winner, onClose }) {
+  if (!winner) return null;
+  const winnerName = winner === 'crewmates' ? 'Crewmates' : 'Impostors';
+  return (
+    <Snackbar open autoHideDuration={6000} onClose={onClose} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
+      <Alert onClose={onClose} severity={winner === 'crewmates' ? 'success' : 'error'} variant="filled">
+        {winnerName} win!
+      </Alert>
+    </Snackbar>
+  );
+}
 
 function decodeVapidKey(key) {
   const padding = '='.repeat((4 - (key.length % 4)) % 4);
@@ -34,9 +46,13 @@ export default function Player() {
   const socketRef = useRef(null);
   const authIdRef = useRef(authId);
   authIdRef.current = authId;
+  const pushReadyRef = useRef(false);
+  pushReadyRef.current = pushEnabled && pushSubscriptionSaved;
   const playerActionsRef = useRef({});
   const [meeting, setMeeting] = useState(false);
   const [gameActive, setGameActive] = useState(false);
+  const [gameWinner, setGameWinner] = useState(null);
+  const [isDead, setIsDead] = useState(false);
   const [isImpostor, setIsImpostor] = useState(false);
   const [killCooldownRemainingMs, setKillCooldownRemainingMs] = useState(0);
   const [mapOpen, setMapOpen] = useState(false);
@@ -133,6 +149,8 @@ export default function Player() {
       playerActionsRef.current.stopAllSounds();
       setHasUsedSabotage(false);
       setSabotageEndMs(0);
+      setGameWinner(null);
+      setIsDead(false);
       setGameActive(true);
     });
     socket.on('game-ended', () => {
@@ -141,6 +159,7 @@ export default function Player() {
       setSabotageEndMs(0);
       setSabotageChargesRemaining(0);
       setGameActive(false);
+      setIsDead(false);
       setMeeting(false);
       setTasks({});
       setProgress(0);
@@ -148,9 +167,11 @@ export default function Player() {
     socket.on('state', (s) => {
       setMeeting(!!s?.isMeeting);
       setGameActive(!!s?.isGameActive);
+      setGameWinner(['crewmates', 'impostors'].includes(s?.gameWinner) ? s.gameWinner : null);
       setMapUrl(typeof s?.mapUrl === 'string' ? s.mapUrl : '');
       if (typeof s?.sabotageChargesRemaining === 'number') setSabotageChargesRemaining(s.sabotageChargesRemaining);
     });
+    socket.on('player-dead', () => setIsDead(true));
     socket.on('sabotage-started', ({ endMs }) => {
       setSabotageEndMs(endMs || 0);
       playerActionsRef.current.playLoop('/sounds/sabotage.mp3', endMs);
@@ -169,8 +190,20 @@ export default function Player() {
       const remaining = endMs - Date.now();
       setKillCooldownRemainingMs(Math.max(0, remaining));
     });
-    socket.on('play-win', async () => {
+    socket.on('game-won', async (result) => {
+      if (!['crewmates', 'impostors'].includes(result?.winner)) return;
+      setGameWinner(result.winner);
       await playerActionsRef.current.playSound('/sounds/you-win.mp3');
+      if ('Notification' in window && Notification.permission === 'granted' &&
+          !pushReadyRef.current &&
+          document.visibilityState === 'visible') {
+        const winnerName = result.winner === 'crewmates' ? 'Crewmates' : 'Impostors';
+        new Notification(`${winnerName} win!`, {
+          body: result.body || 'The game has finished.',
+          tag: 'among-us-game-won',
+          icon: '/images/emergency-meeting.jpg'
+        });
+      }
     });
 
     return () => {
@@ -332,7 +365,7 @@ export default function Player() {
 
   // Players report by clicking the report image, not via keyboard
 
-  const disableTasks = meeting || !gameActive;
+  const disableTasks = meeting || !gameActive || isDead;
   useEffect(() => {
     const i = setInterval(() => {
       setKillCooldownRemainingMs((prev) => {
@@ -454,7 +487,12 @@ export default function Player() {
         )}
         <Card sx={{ width: '100%', maxWidth: 420 }}>
           <CardContent>
-            <Typography variant="h5" align="center">GAME NOT STARTED</Typography>
+            <Typography variant="h5" align="center">{gameWinner ? 'GAME OVER' : 'GAME NOT STARTED'}</Typography>
+            {gameWinner && (
+              <Typography align="center">
+                {gameWinner === 'crewmates' ? 'Crewmates' : 'Impostors'} win!
+              </Typography>
+            )}
           </CardContent>
         </Card>
         <Tooltip title="Open Map">
@@ -467,6 +505,7 @@ export default function Player() {
             <Box component="img" src={mapUrl || '/images/MAP.JPG'} alt="Map" sx={{ maxWidth: '90vw', maxHeight: '80vh', display: 'block' }} />
           </DialogContent>
         </Dialog>
+        <WinnerSnackbar winner={gameWinner} onClose={() => setGameWinner(null)} />
       </Stack>
     );
   }
@@ -488,6 +527,7 @@ export default function Player() {
             <Typography align="center">Please wait until the next round to join.</Typography>
           </CardContent>
         </Card>
+        <WinnerSnackbar winner={gameWinner} onClose={() => setGameWinner(null)} />
       </Stack>
     );
   }
@@ -509,7 +549,7 @@ export default function Player() {
         <Button size="small" variant="text" onClick={resetStopwatch} disabled={stopwatchMs === 0}>Reset</Button>
       </Stack>
       <Stack direction="row" spacing={2} alignItems="center" justifyContent="center">
-        <Box component="img" src="/images/report.png" alt="Report" sx={{ width: 140, cursor: 'pointer', borderRadius: 1 }} onClick={() => socketRef.current?.emit('report')} />
+        <Box component="img" src="/images/report.png" alt="Report" sx={{ width: 140, cursor: isDead ? 'not-allowed' : 'pointer', opacity: isDead ? 0.5 : 1, borderRadius: 1 }} onClick={() => { if (!isDead) socketRef.current?.emit('report'); }} />
         {isImpostor && (
           <Box sx={{ position: 'relative', width: 140 }}>
             <Box component="img" src={killCooldownRemainingMs > 0 ? '/images/kill-cooldown.png' : '/images/kill.png'} alt="Kill" sx={{ width: '100%', cursor: killCooldownRemainingMs > 0 ? 'not-allowed' : 'pointer', borderRadius: 1 }} onClick={() => { if (killCooldownRemainingMs <= 0) socketRef.current?.emit('kill'); }} />
@@ -543,6 +583,20 @@ export default function Player() {
           You are {role === 'Impostor' ? 'an' : 'a'} {role}.
         </Alert>
       ) : null}
+      {isDead && <Alert severity="warning">You are eliminated and can no longer complete tasks.</Alert>}
+      {gameActive && role === 'Crewmate' && !isDead && (
+        <Button
+          variant="outlined"
+          color="error"
+          onClick={() => {
+            if (window.confirm('Confirm that you have been eliminated?')) {
+              socketRef.current?.emit('mark-dead');
+            }
+          }}
+        >
+          Mark me as eliminated
+        </Button>
+      )}
 
       <Card sx={{ width: '100%', maxWidth: 420, textAlign: 'left' }}>
         <CardContent>
@@ -580,6 +634,7 @@ export default function Player() {
           <Box component="img" src={mapUrl || '/images/MAP.JPG'} alt="Map" sx={{ maxWidth: '90vw', maxHeight: '80vh', display: 'block' }} />
         </DialogContent>
       </Dialog>
+      <WinnerSnackbar winner={gameWinner} onClose={() => setGameWinner(null)} />
     </Stack>
   );
 }

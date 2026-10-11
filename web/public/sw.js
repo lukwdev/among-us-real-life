@@ -9,7 +9,7 @@ self.addEventListener('push', (event) => {
   event.waitUntil(self.registration.showNotification(payload.title || 'Among Us in Real Life', {
     body: payload.body || 'A meeting needs your attention.',
     icon: '/images/emergency-meeting.jpg',
-    tag: 'among-us-meeting',
+    tag: payload.tag || 'among-us-notification',
     data: { url: payload.url || '/' }
   }));
 });

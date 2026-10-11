@@ -1,7 +1,7 @@
-function createMeetingNotifier({ webPush, isEnabled, getSubscriptions, removeSubscription, persistState }) {
-	return async function notifyMeetingPlayers(title, body) {
+function createPushNotifier({ webPush, isEnabled, getSubscriptions, removeSubscription, persistState }) {
+	return async function sendPushNotification(title, body, tag = 'among-us-notification') {
 		if (!isEnabled) return;
-		const notification = JSON.stringify({ title, body, url: '/' });
+		const notification = JSON.stringify({ title, body, url: '/', tag });
 		for (const [playerId, subscriptions] of Object.entries(getSubscriptions())) {
 			for (const [subscriptionId, subscription] of Object.entries(subscriptions)) {
 				try {
@@ -11,7 +11,7 @@ function createMeetingNotifier({ webPush, isEnabled, getSubscriptions, removeSub
 						removeSubscription(playerId, subscriptionId);
 						persistState();
 					} else {
-						console.error('[push] Unable to send meeting notification:', error);
+						console.error('[push] Unable to send notification:', error);
 					}
 				}
 			}
@@ -19,4 +19,4 @@ function createMeetingNotifier({ webPush, isEnabled, getSubscriptions, removeSub
 	};
 }
 
-module.exports = { createMeetingNotifier };
+module.exports = { createPushNotifier };
