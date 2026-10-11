@@ -16,24 +16,42 @@ function Header() {
   );
 }
 
-function App() {
+function AppContent() {
+  const location = useLocation();
+  const isAdmin = location.pathname.startsWith('/admin');
+
   return (
-    <BrowserRouter>
+    <>
       <Header />
       <Box sx={{
-        py: 3,
+        py: { xs: 1, sm: 3 },
         display: 'flex',
         justifyContent: 'center',
-        alignItems: 'center',
+        alignItems: isAdmin ? 'flex-start' : 'center',
         minHeight: 'calc(100vh - 64px)'
       }}>
-        <Container maxWidth="sm" sx={{ textAlign: 'center' }}>
+        <Container
+          maxWidth={isAdmin ? false : 'sm'}
+          sx={{
+            width: '100%',
+            px: { xs: 1, sm: 2 },
+            textAlign: isAdmin ? 'left' : 'center'
+          }}
+        >
           <Routes>
             <Route path="/" element={<Player />} />
             <Route path="/admin" element={<Admin />} />
           </Routes>
         </Container>
       </Box>
+    </>
+  );
+}
+
+function App() {
+  return (
+    <BrowserRouter>
+      <AppContent />
     </BrowserRouter>
   )
 }

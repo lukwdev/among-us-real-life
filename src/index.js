@@ -85,6 +85,13 @@ const DEFAULT_TASKS_PER_PLAYER = N_TASKS;
 let taskProgress = Object.create(null);
 let isMeeting = false;
 let isGameActive = false;
+const DEFAULT_TASK_COLLECTION_ID = 'default';
+let taskCollections = [{
+	id: DEFAULT_TASK_COLLECTION_ID,
+	name: 'Standard',
+	tasks: TASKS.slice()
+}];
+let selectedTaskCollectionId = DEFAULT_TASK_COLLECTION_ID;
 let gameConfig = {
 	tasks: TASKS,
 	numImpostors: N_IMPOSTORS,
@@ -119,6 +126,8 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const STATE_FILE = path.join(DATA_DIR, 'game-state.json');
 let playerDirectory = Object.create(null);
 let pushSubscriptions = Object.create(null);
+let adminSessions = Object.create(null);
+const ADMIN_SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 
 loadPersistentState();
 
@@ -148,15 +157,38 @@ io.on('connection', socket => {
 
 	// Allow clients to request a fresh snapshot of state
 	socket.on('get-state', () => {
-		socket.emit('state', getStateSnapshot(socket.data.isAdmin === true));
+		socket.emit('state', getStateSnapshot(isAuthenticatedAdmin(socket)));
 		console.log('[get-state]', { socketId: socket.id, auth: socketIdToAuth[socket.id], isMeeting, isGameActive, emergencyCooldownEndMs });
 	});
 
 	socket.on('admin-login', (payload, acknowledge) => {
 		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		if (typeof payload?.sessionToken === 'string') {
+			if (!/^[A-Za-z0-9_-]{43}$/.test(payload.sessionToken)) {
+				return reply({ ok: false, reason: 'invalid-session' });
+			}
+			const sessionHash = hashAdminSession(payload.sessionToken);
+			const expiresAt = adminSessions[sessionHash];
+			if (!expiresAt || expiresAt <= Date.now()) {
+				if (expiresAt) {
+					const previousExpiresAt = expiresAt;
+					delete adminSessions[sessionHash];
+					if (!persistState()) adminSessions[sessionHash] = previousExpiresAt;
+				}
+				return reply({ ok: false, reason: 'invalid-session' });
+			}
+			socket.data.isAdmin = true;
+			socket.data.adminSessionHash = sessionHash;
+			reply({ ok: true, sessionExpiresAt: expiresAt });
+			socket.emit('state', getStateSnapshot(true));
+			socket.emit('players-updated', getConnectedPlayers());
+			return;
+		}
+
 		if (!adminCode) {
 			return reply({ ok: false, reason: 'admin-not-configured' });
 		}
+
 		const submittedCode = typeof payload?.code === 'string' ? Buffer.from(payload.code) : Buffer.alloc(0);
 		const configuredCode = typeof adminCode === 'string' ? Buffer.from(adminCode) : Buffer.alloc(0);
 		const valid = submittedCode.length === configuredCode.length &&
@@ -165,10 +197,37 @@ io.on('connection', socket => {
 			return reply({ ok: false, reason: 'invalid-code' });
 		}
 
+		const sessionToken = crypto.randomBytes(32).toString('base64url');
+		const sessionHash = hashAdminSession(sessionToken);
+		adminSessions[sessionHash] = Date.now() + ADMIN_SESSION_DURATION_MS;
+		if (!persistState()) {
+			delete adminSessions[sessionHash];
+			return reply({ ok: false, reason: 'persistence-unavailable' });
+		}
 		socket.data.isAdmin = true;
-		reply({ ok: true });
+		socket.data.adminSessionHash = sessionHash;
+		reply({
+			ok: true,
+			sessionToken,
+			sessionExpiresAt: adminSessions[sessionHash]
+		});
 		socket.emit('state', getStateSnapshot(true));
 		socket.emit('players-updated', getConnectedPlayers());
+	});
+
+	socket.on('admin-logout', acknowledge => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		if (socket.data.adminSessionHash) {
+			const expiresAt = adminSessions[socket.data.adminSessionHash];
+			delete adminSessions[socket.data.adminSessionHash];
+			if (!persistState()) {
+				if (expiresAt) adminSessions[socket.data.adminSessionHash] = expiresAt;
+				return reply({ ok: false, reason: 'persistence-unavailable' });
+			}
+		}
+		socket.data.isAdmin = false;
+		delete socket.data.adminSessionHash;
+		reply({ ok: true });
 	});
 
 	socket.on('player-login', (payload, acknowledge) => {
@@ -217,7 +276,7 @@ io.on('connection', socket => {
 	socket.on('remove-player', (payload, acknowledge) => {
 		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
 		const playerId = typeof payload?.playerId === 'string' ? payload.playerId : '';
-		if (!socket.data.isAdmin) {
+		if (!isAuthenticatedAdmin(socket)) {
 			return reply({ ok: false, reason: 'unauthorized' });
 		}
 		if (isGameActive) {
@@ -267,6 +326,50 @@ io.on('connection', socket => {
 		reply({ ok: true });
 		broadcastPlayersToAdmins();
 		console.log('[player-removed]', { playerId });
+	});
+
+	socket.on('save-task-collections', (payload, acknowledge) => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		if (!isAuthenticatedAdmin(socket)) {
+			return reply({ ok: false, reason: 'unauthorized' });
+		}
+		if (isGameActive) {
+			return reply({ ok: false, reason: 'game-active' });
+		}
+		const collections = payload?.collections;
+		if (!isValidTaskCollections(collections)) {
+			return reply({ ok: false, reason: 'invalid-collections' });
+		}
+		const requestedSelection = typeof payload?.selectedTaskCollectionId === 'string'
+			? payload.selectedTaskCollectionId
+			: selectedTaskCollectionId;
+		const selectedCollection = collections.find(collection => collection.id === requestedSelection);
+		if (!selectedCollection) {
+			return reply({ ok: false, reason: 'invalid-collections' });
+		}
+
+		const previousCollections = taskCollections;
+		const previousSelectedCollectionId = selectedTaskCollectionId;
+		const previousConfiguredTasks = gameConfig.tasks;
+		taskCollections = collections.map(collection => ({
+			id: collection.id,
+			name: collection.name.trim(),
+			tasks: collection.tasks.map(task => task.trim())
+		}));
+		selectedTaskCollectionId = selectedCollection.id;
+		gameConfig.tasks = selectedCollection.tasks.slice();
+		if (!persistState()) {
+			taskCollections = previousCollections;
+			selectedTaskCollectionId = previousSelectedCollectionId;
+			gameConfig.tasks = previousConfiguredTasks;
+			return reply({ ok: false, reason: 'persistence-unavailable' });
+		}
+		reply({
+			ok: true,
+			collections: taskCollections,
+			selectedTaskCollectionId
+		});
+		broadcastAdminState();
 	});
 
 	socket.on('get-push-config', acknowledge => {
@@ -339,15 +442,28 @@ io.on('connection', socket => {
 	});
 
 	socket.on('start-game', payload => {
-		if (!socket.data.isAdmin) {
+		if (!isAuthenticatedAdmin(socket)) {
 			return socket.emit('start-error', { reason: 'unauthorized' });
 		}
 		if (isGameActive) {
 			return socket.emit('start-error', { reason: 'game-already-active' });
 		}
+		const requestedCollectionId = typeof payload?.taskCollectionId === 'string'
+			? payload.taskCollectionId
+			: selectedTaskCollectionId;
+		const selectedCollection = taskCollections.find(collection => collection.id === requestedCollectionId);
+		if (!selectedCollection) {
+			return socket.emit('start-error', { reason: 'invalid-task-collection' });
+		}
+		if (selectedCollection.tasks.length === 0) {
+			return socket.emit('start-error', { reason: 'empty-task-collection' });
+		}
 		// Update runtime config from admin payload if provided
 		if (payload && typeof payload === 'object') {
-			if (Array.isArray(payload.tasks) && payload.tasks.length > 0) {
+			if (selectedCollection) {
+				selectedTaskCollectionId = selectedCollection.id;
+				gameConfig.tasks = selectedCollection.tasks.slice();
+			} else if (Array.isArray(payload.tasks) && payload.tasks.length > 0) {
 				gameConfig.tasks = payload.tasks;
 			}
 			if (typeof payload.numImpostors === 'number' && payload.numImpostors >= 0) {
@@ -375,6 +491,7 @@ io.on('connection', socket => {
 				gameConfig.sabotageCharges = payload.sabotageCharges;
 			}
 		}
+		selectedTaskCollectionId = selectedCollection?.id || requestedCollectionId;
 		console.log('[start-game] config', gameConfig);
 		// Get player sockets
 		const players = [];
@@ -541,7 +658,7 @@ io.on('connection', socket => {
 	});
 
 	socket.on('emergency-meeting', () => {
-		if ((!socket.data.playerId && !socket.data.isAdmin) || !isGameActive || isMeeting) return;
+		if ((!socket.data.playerId && !isAuthenticatedAdmin(socket)) || !isGameActive || isMeeting) return;
 		if (Date.now() < emergencyCooldownEndMs) return;
 		isMeeting = true;
 		lastMeetingType = 'emergency';
@@ -553,7 +670,7 @@ io.on('connection', socket => {
 	});
 
 	socket.on('continue-game', () => {
-		if (!socket.data.isAdmin || !isGameActive) return;
+		if (!isAuthenticatedAdmin(socket) || !isGameActive) return;
 		isMeeting = false;
 		// Reset kill cooldown for all impostors at the end of a meeting
 		const killMs = Math.max(0, (gameConfig.killCooldownSeconds || 0) * 1000);
@@ -578,7 +695,7 @@ io.on('connection', socket => {
 	});
 
 	socket.on('end-game', () => {
-		if (!socket.data.isAdmin || !isGameActive) return;
+		if (!isAuthenticatedAdmin(socket) || !isGameActive) return;
 		isMeeting = false;
 		isGameActive = false;
 		emergencyCooldownEndMs = 0;
@@ -722,6 +839,8 @@ function getStateSnapshot(includeAdminData) {
 		config: includeAdminData ? gameConfig : undefined,
 		sabotageEndMs,
 		sabotageChargesRemaining,
+		taskCollections: includeAdminData ? taskCollections : undefined,
+		selectedTaskCollectionId: includeAdminData ? selectedTaskCollectionId : undefined,
 		players: includeAdminData ? getConnectedPlayers() : undefined
 	};
 }
@@ -749,6 +868,9 @@ function sendPlayerSnapshot(socket, playerId) {
 function persistState() {
 	const snapshot = {
 		version: 1,
+		adminSessions,
+		taskCollections,
+		selectedTaskCollectionId,
 		gameConfig,
 		playerDirectory,
 		pushSubscriptions,
@@ -796,6 +918,9 @@ function loadPersistentState() {
 		if (!isRecord(saved) || saved.version !== 1) {
 			throw new Error('Unsupported or invalid saved-state format');
 		}
+		if (saved.taskCollections !== undefined && !isValidTaskCollections(saved.taskCollections)) {
+			throw new Error('Saved state contains invalid task collections');
+		}
 		const recordFields = ['gameConfig', 'playerDirectory', 'authToPlayer', 'taskProgress', 'killCooldownEndMsByAuth'];
 		if (recordFields.some(field => !isRecord(saved[field])) ||
 			!Array.isArray(saved.impostorAuths) ||
@@ -836,13 +961,41 @@ function loadPersistentState() {
 				))) {
 			throw new Error('Saved state contains invalid push subscriptions');
 		}
+		if (saved.adminSessions !== undefined &&
+			(!isRecord(saved.adminSessions) ||
+				!Object.values(saved.adminSessions).every(expiresAt => Number.isFinite(expiresAt)))) {
+			throw new Error('Saved state contains invalid admin sessions');
+		}
 
 		if (saved.gameConfig && typeof saved.gameConfig === 'object') {
 			gameConfig = { ...gameConfig, ...saved.gameConfig };
 			if (!Array.isArray(gameConfig.tasks)) gameConfig.tasks = TASKS;
 		}
+		if (Array.isArray(saved.taskCollections)) {
+			taskCollections = saved.taskCollections.map(collection => ({
+				id: collection.id,
+				name: collection.name.trim(),
+				tasks: collection.tasks.map(task => task.trim())
+			}));
+		} else {
+			taskCollections = [{
+				id: DEFAULT_TASK_COLLECTION_ID,
+				name: 'Standard',
+				tasks: gameConfig.tasks.slice()
+			}];
+		}
+		selectedTaskCollectionId = typeof saved.selectedTaskCollectionId === 'string' &&
+			taskCollections.some(collection => collection.id === saved.selectedTaskCollectionId)
+			? saved.selectedTaskCollectionId
+			: taskCollections[0].id;
 		playerDirectory = Object.assign(Object.create(null), saved.playerDirectory);
 		pushSubscriptions = Object.assign(Object.create(null), saved.pushSubscriptions || {});
+		adminSessions = Object.assign(Object.create(null), saved.adminSessions || {});
+		for (const [sessionHash, expiresAt] of Object.entries(adminSessions)) {
+			if (!/^[a-f0-9]{64}$/.test(sessionHash) || expiresAt <= Date.now()) {
+				delete adminSessions[sessionHash];
+			}
+		}
 		authToPlayer = Object.assign(Object.create(null), saved.authToPlayer);
 		if (saved.taskProgress && typeof saved.taskProgress === 'object') {
 			taskProgress = Object.assign(Object.create(null), saved.taskProgress);
@@ -875,6 +1028,44 @@ function loadPersistentState() {
 
 function isRecord(value) {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hashAdminSession(token) {
+	return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function isAuthenticatedAdmin(socket) {
+	const sessionHash = socket.data.adminSessionHash;
+	return socket.data.isAdmin === true &&
+		typeof sessionHash === 'string' &&
+		Number.isFinite(adminSessions[sessionHash]) &&
+		adminSessions[sessionHash] > Date.now();
+}
+
+function isValidTaskCollections(collections) {
+	if (!Array.isArray(collections) || collections.length < 1 || collections.length > 100) {
+		return false;
+	}
+	const ids = new Set();
+	const names = new Set();
+	return collections.every(collection => {
+		if (!isRecord(collection) ||
+			typeof collection.id !== 'string' ||
+			!/^[a-zA-Z0-9_-]{1,80}$/.test(collection.id) ||
+			typeof collection.name !== 'string' ||
+			!collection.name.trim() ||
+			collection.name.trim().length > 64 ||
+			!Array.isArray(collection.tasks) ||
+			collection.tasks.length > 500 ||
+			!collection.tasks.every(task => typeof task === 'string' && task.trim().length > 0 && task.trim().length <= 200)) {
+			return false;
+		}
+		const normalizedName = collection.name.trim().toLocaleLowerCase();
+		if (ids.has(collection.id) || names.has(normalizedName)) return false;
+		ids.add(collection.id);
+		names.add(normalizedName);
+		return true;
+	});
 }
 
 function isValidPushSubscription(subscription) {
@@ -954,9 +1145,16 @@ function getConnectedPlayers() {
 function broadcastPlayersToAdmins() {
 	const players = getConnectedPlayers();
 	for (const socket of io.of('/').sockets.values()) {
-		if (socket.data.isAdmin) {
+		if (isAuthenticatedAdmin(socket)) {
 			socket.emit('players-updated', players);
 		}
+	}
+}
+
+function broadcastAdminState() {
+	const state = getStateSnapshot(true);
+	for (const socket of io.of('/').sockets.values()) {
+		if (isAuthenticatedAdmin(socket)) socket.emit('state', state);
 	}
 }
 
