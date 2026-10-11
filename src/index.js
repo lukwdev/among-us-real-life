@@ -4,10 +4,13 @@ const express = require('express');
 const http = require('http');
 const fs = require('fs');
 const crypto = require('crypto');
+const dotenv = require('dotenv');
 const _ = require('lodash');
 const path = require('path');
 const { Server } = require('socket.io');
 const webPush = require('web-push');
+
+dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
 const adminCode = process.env.ADMIN_CODE;
 const vapidPublicKey = process.env.VAPID_PUBLIC_KEY;
@@ -120,21 +123,11 @@ let pushSubscriptions = Object.create(null);
 loadPersistentState();
 
 app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
-app.use('/', express.static(path.join(__dirname, 'public')));
-
 if (process.env.NODE_ENV === 'production') {
 	const clientBuildPath = path.join(__dirname, '..', 'web', 'dist');
 	app.use(express.static(clientBuildPath));
-	app.get('*', (req, res) => {
+	app.get('/{*path}', (req, res) => {
 		res.sendFile(path.join(clientBuildPath, 'index.html'));
-	});
-} else {
-	app.get('/', (req, res) => {
-		res.sendFile(path.join(__dirname, 'views', 'index.html'));
-	});
-
-	app.get('/admin', (req, res) => {
-		res.sendFile(path.join(__dirname, 'views', 'admin.html'));
 	});
 }
 

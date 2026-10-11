@@ -40,7 +40,9 @@ The Compose setup builds the frontend and backend, keeps game data in a named vo
 cp .env.example .env
 ```
 
-Set a strong, private `ADMIN_CODE` in `.env`. For background meeting notifications, generate a VAPID key pair with `npx web-push generate-vapid-keys` and set both `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY`; leave both empty to disable push notifications. Set `PUSH_SUBJECT` to a contact email or an HTTPS URL. Keep the private key and `.env` out of source control.
+Set a strong, private `ADMIN_CODE` in the **repository-root** `.env` file. The admin code is a server setting, not a Vite/frontend setting: do not put it in `web/.env` or name it `VITE_ADMIN_CODE`. Direct `npm start` and Docker Compose both load the root `.env`; Compose refuses to start if `ADMIN_CODE` is missing.
+
+For background meeting notifications, generate a VAPID key pair with `npx web-push generate-vapid-keys` and set both `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` in the root `.env`; leave both empty to disable push notifications. Set `PUSH_SUBJECT` to a contact email or an HTTPS URL. Keep the private key and `.env` out of source control.
 
 ```sh
 docker compose up --build -d
@@ -55,14 +57,16 @@ Hosting platforms with ephemeral disks (including free Render services) will los
 
 ### 3. Run locally without Docker
 
-Start the backend with
+Copy `.env.example` to `.env` in the repository root, then set `ADMIN_CODE`. Start the app with:
 
 ```
-$ npm install
+$ npm ci
+$ npm ci --prefix web
+$ npm run build:web
 $ npm start
 ```
 
-:information_source: Use a utility like [Nodemon](https://nodemon.io/) to automatically restart the backend upon any changes. This is useful when modifying the number of impostors or tasks.
+The production server serves the built React app at `/` and `/admin`. During development, run `npm run dev`; Vite proxies game sockets and media to the backend.
 
 ### 4. Connect to the admin dashboard
 
