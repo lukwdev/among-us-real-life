@@ -35,6 +35,14 @@ export default function Player() {
     }
   });
   const [nameInput, setNameInput] = useState(playerName);
+  const [playerCode, setPlayerCode] = useState(() => {
+    try {
+      return localStorage.getItem('playerJoinCode') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [playerCodeRequired, setPlayerCodeRequired] = useState(true);
   const [loginAttempt, setLoginAttempt] = useState(0);
   const [loginError, setLoginError] = useState('');
   const [isConnected, setIsConnected] = useState(false);
@@ -65,6 +73,21 @@ export default function Player() {
   const [stopwatchRunning, setStopwatchRunning] = useState(false);
   const [stopwatchMs, setStopwatchMs] = useState(0);
   const swLastTickRef = useRef(0);
+  const playerCodeRef = useRef(playerCode);
+  playerCodeRef.current = playerCode;
+
+  useEffect(() => {
+    fetch('/api/player-auth-config')
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      })
+      .then((config) => setPlayerCodeRequired(config.required !== false))
+      .catch((error) => {
+        console.warn('Could not load player access configuration; keeping access code required.', error);
+        setPlayerCodeRequired(true);
+      });
+  }, []);
 
   useEffect(() => {
     if (!playerName) return;
@@ -73,13 +96,23 @@ export default function Player() {
 
     socket.on('connect', () => {
       setIsConnected(false);
-      socket.timeout(10000).emit('player-login', { name: playerName }, (timeoutError, response) => {
+      socket.timeout(10000).emit('player-login', { name: playerName, code: playerCodeRef.current }, (timeoutError, response) => {
         if (timeoutError || !response?.ok) {
           const messages = {
             'invalid-name': 'Enter a name between 1 and 32 characters.',
             'name-in-use': 'That name is already connected. Choose a different name.',
+            'invalid-player-code': 'The player access code is incorrect.',
+            'player-code-not-configured': 'The server has not configured a player access code.',
             'persistence-unavailable': 'The server could not save your player profile. Please try again later.'
           };
+          if (response?.reason === 'invalid-player-code') {
+            try {
+              localStorage.removeItem('playerJoinCode');
+            } catch (error) {
+              console.warn('Could not clear the invalid player access code.', error);
+            }
+            setPlayerCode('');
+          }
           setLoginError(messages[response?.reason] || 'Could not connect to the game. Please try again.');
           socket.disconnect();
           return;
@@ -89,8 +122,11 @@ export default function Player() {
         setIsConnected(true);
         try {
           localStorage.setItem('playerName', response.name);
+          if (playerCodeRef.current) {
+            localStorage.setItem('playerJoinCode', playerCodeRef.current);
+          }
         } catch {
-          console.warn('Could not save the player name in browser storage.');
+          console.warn('Could not save the player credentials in browser storage.');
         }
         socket.timeout(5000).emit('get-push-config', (configError, config) => {
           if (configError) {
@@ -119,6 +155,7 @@ export default function Player() {
     socket.on('player-removed', () => {
       try {
         localStorage.removeItem('playerName');
+        localStorage.removeItem('playerJoinCode');
         localStorage.removeItem(`imp_completed_${authIdRef.current}`);
       } catch (error) {
         console.warn('Could not clear saved player data after roster removal.', error);
@@ -259,6 +296,11 @@ export default function Player() {
       return;
     }
     setLoginError('');
+    try {
+      localStorage.setItem('playerJoinCode', playerCode);
+    } catch {
+      console.warn('Could not save the player access code in browser storage.');
+    }
     setPlayerName(name);
     setLoginAttempt((attempt) => attempt + 1);
   }
@@ -466,6 +508,16 @@ export default function Player() {
                 required
                 fullWidth
               />
+              {playerCodeRequired && (
+                <TextField
+                  label="Player access code"
+                  type="password"
+                  value={playerCode}
+                  onChange={(event) => setPlayerCode(event.target.value)}
+                  required
+                  fullWidth
+                />
+              )}
               <Button type="submit" variant="contained">Connect</Button>
             </Stack>
           </CardContent>

@@ -1,9 +1,10 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { Accordion, AccordionDetails, AccordionSummary, Alert, Box, Button, Card, CardContent, Chip, Divider, FormControl, IconButton, InputLabel, LinearProgress, MenuItem, Paper, Select, Snackbar, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material';
+import { Accordion, AccordionDetails, AccordionSummary, Alert, Box, Button, Card, CardContent, Chip, Divider, FormControl, IconButton, InputLabel, LinearProgress, MenuItem, Paper, Select, Snackbar, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Tooltip, Typography } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
+import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 
 function splitTaskLabel(label) {
     const match = /^(.*)\s+\(([^()]*)\)$/.exec(label);
@@ -325,6 +326,7 @@ export default function Admin() {
     const [startError, setStartError] = useState('');
     const [playerManagementMessage, setPlayerManagementMessage] = useState('');
     const [globalProgress, setGlobalProgress] = useState({ completed: 0, total: 0, ratio: 0 });
+    const [playerJoinCode, setPlayerJoinCode] = useState('');
     const [mapUploadInProgress, setMapUploadInProgress] = useState(false);
 
     useEffect(() => {
@@ -443,6 +445,9 @@ export default function Admin() {
             // Update connected players from state
             if (Array.isArray(s?.players)) {
                 setConnectedPlayers(s.players);
+            }
+            if (typeof s?.playerJoinCode === 'string') {
+                setPlayerJoinCode(s.playerJoinCode);
             }
         });
 
@@ -827,6 +832,61 @@ export default function Admin() {
                 )}
                 {startError && <Alert severity="error">{startError}</Alert>}
                 {playerManagementMessage && <Alert severity="info">{playerManagementMessage}</Alert>}
+                {playerJoinCode && (
+                    <Card
+                        sx={{
+                            border: 2,
+                            borderColor: 'primary.dark',
+                            bgcolor: 'primary.dark',
+                            color: 'common.white'
+                        }}
+                    >
+                        <CardContent sx={{ py: { xs: 2, sm: 2.5 }, '&:last-child': { pb: { xs: 2, sm: 2.5 } } }}>
+                            <Stack
+                                direction={{ xs: 'column', sm: 'row' }}
+                                spacing={{ xs: 1, sm: 2 }}
+                                alignItems={{ xs: 'stretch', sm: 'center' }}
+                                justifyContent="space-between"
+                            >
+                                <Box>
+                                    <Typography variant="overline" fontWeight={700}>
+                                        Player access code
+                                    </Typography>
+                                    <Typography variant="body2">
+                                        Share this code with players before they join.
+                                    </Typography>
+                                </Box>
+                                <Stack direction="row" spacing={1} alignItems="center">
+                                    <Typography
+                                        component="code"
+                                        sx={{
+                                            px: 1.5,
+                                            py: 0.75,
+                                            borderRadius: 1,
+                                            bgcolor: 'common.white',
+                                            color: '#111827',
+                                            fontSize: { xs: '1.75rem', sm: '2rem' },
+                                            fontWeight: 800,
+                                            letterSpacing: '0.18em',
+                                            lineHeight: 1
+                                        }}
+                                    >
+                                        {playerJoinCode}
+                                    </Typography>
+                                    <Tooltip title="Copy player access code">
+                                        <IconButton
+                                            aria-label="Copy player access code"
+                                            onClick={() => navigator.clipboard?.writeText(playerJoinCode)}
+                                            sx={{ color: 'common.white' }}
+                                        >
+                                            <ContentCopyIcon />
+                                        </IconButton>
+                                    </Tooltip>
+                                </Stack>
+                            </Stack>
+                        </CardContent>
+                    </Card>
+                )}
                 <Card>
                     <CardContent>
                         <Stack spacing={1}>
@@ -850,7 +910,6 @@ export default function Admin() {
                         </Stack>
                     </CardContent>
                 </Card>
-
                 {showStart && (
                     <TaskCollectionEditor
                         taskCollections={taskCollections}
@@ -891,11 +950,20 @@ export default function Admin() {
                                 <Paper key={player.id} variant="outlined" sx={{ p: 1.5 }}>
                                     <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
                                         <Box sx={{ minWidth: 0 }}>
-                                            <Typography fontWeight={600} noWrap>{player.name || 'Unknown'}</Typography>
+                                            <Stack direction="row" spacing={0.75} alignItems="center">
+                                                <Typography fontWeight={600} noWrap>{player.name || 'Unknown'}</Typography>
+                                                {player.alive === false && (
+                                                    <Tooltip title="Eliminated">
+                                                        <Typography component="span" color="error.main" aria-label="Eliminated" sx={{ lineHeight: 1 }}>
+                                                            💀
+                                                        </Typography>
+                                                    </Tooltip>
+                                                )}
+                                            </Stack>
                                             <Chip
                                                 size="small"
                                                 color={player.connected ? 'success' : 'default'}
-                                                label={`${player.connected ? 'Connected' : 'Offline'}${player.alive === false ? ' · Dead' : ''}`}
+                                                label={player.connected ? 'Connected' : 'Offline'}
                                             />
                                         </Box>
                                         <IconButton
@@ -929,11 +997,21 @@ export default function Admin() {
                                     ) : (
                                         connectedPlayers.map((player, idx) => (
                                             <TableRow key={player.id || idx} hover>
-                                                <TableCell>{player.name || 'Unknown'}</TableCell>
+                                                <TableCell>
+                                                    <Stack direction="row" spacing={0.75} alignItems="center">
+                                                        <Typography>{player.name || 'Unknown'}</Typography>
+                                                        {player.alive === false && (
+                                                            <Tooltip title="Eliminated">
+                                                                <Typography component="span" color="error.main" aria-label="Eliminated" sx={{ lineHeight: 1 }}>
+                                                                    💀
+                                                                </Typography>
+                                                            </Tooltip>
+                                                        )}
+                                                    </Stack>
+                                                </TableCell>
                                                 <TableCell>
                                                     <Typography color={player.connected ? 'success.main' : 'text.secondary'}>
                                                         {player.connected ? 'Connected' : 'Offline'}
-                                                        {player.alive === false ? ' · Dead' : ''}
                                                     </Typography>
                                                 </TableCell>
                                                 <TableCell>

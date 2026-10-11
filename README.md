@@ -39,6 +39,8 @@ cp .env.example .env
 
 Set a strong, private `ADMIN_CODE` in the **repository-root** `.env` file. The admin code is a server setting, not a Vite/frontend setting: do not put it in `web/.env` or name it `VITE_ADMIN_CODE`. Direct `npm start` and Docker Compose both load the root `.env`; Compose refuses to start if `ADMIN_CODE` is missing.
 
+Player access is protected by a randomly generated six-character code by default. The backend creates it once when no code is present in the persisted state, keeps it until the saved state is deleted or replaced, and shows it prominently in the authenticated admin panel. Players must enter this code before joining with their name. It is separate from `ADMIN_CODE`. To deliberately disable the player-code requirement, set `PLAYER_AUTH_REQUIRED=false`.
+
 For background meeting and game-win notifications, generate a VAPID key pair with `npx web-push generate-vapid-keys` and set both `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` in the root `.env`; leave both empty to disable push notifications. Set `PUSH_SUBJECT` to a contact email or an HTTPS URL. Keep the private key and `.env` out of source control.
 
 ```sh

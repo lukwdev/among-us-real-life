@@ -18,6 +18,10 @@ const { createPushNotifier } = require('./push-notifications');
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
 const adminCode = process.env.ADMIN_CODE;
+let playerJoinCode = typeof process.env.PLAYER_JOIN_CODE === 'string'
+	? process.env.PLAYER_JOIN_CODE.trim()
+	: '';
+const playerJoinCodeRequired = process.env.PLAYER_AUTH_REQUIRED !== 'false';
 const vapidPublicKey = process.env.VAPID_PUBLIC_KEY;
 const vapidPrivateKey = process.env.VAPID_PRIVATE_KEY;
 const pushSubject = process.env.PUSH_SUBJECT || 'mailto:admin@example.com';
@@ -156,6 +160,9 @@ const sendPushNotification = createPushNotifier({
 loadPersistentState();
 
 app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
+app.get('/api/player-auth-config', (_req, res) => {
+	res.json({ required: playerJoinCodeRequired });
+});
 app.use('/api', createCollectionMapRouter({
 	express,
 	dataDir: DATA_DIR,
@@ -277,6 +284,18 @@ io.on('connection', socket => {
 
 		if (socket.handshake.query.role !== 'PLAYER') {
 			return reply({ ok: false, reason: 'invalid-role' });
+		}
+		if (playerJoinCodeRequired && !playerJoinCode) {
+			return reply({ ok: false, reason: 'player-code-not-configured' });
+		}
+		if (playerJoinCodeRequired) {
+			const submittedCode = typeof payload?.code === 'string' ? Buffer.from(payload.code) : Buffer.alloc(0);
+			const configuredCode = Buffer.from(playerJoinCode);
+			const valid = submittedCode.length === configuredCode.length &&
+				crypto.timingSafeEqual(submittedCode, configuredCode);
+			if (!valid) {
+				return reply({ ok: false, reason: 'invalid-player-code' });
+			}
 		}
 		if (!name || name.length > 32 || /[\u0000-\u001f\u007f]/.test(name)) {
 			return reply({ ok: false, reason: 'invalid-name' });
@@ -920,6 +939,15 @@ function finishGame(winner) {
 	console.log('[game-won]', { winner });
 }
 
+function generatePlayerJoinCode() {
+	const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+	let code = '';
+	for (let index = 0; index < 6; index += 1) {
+		code += alphabet[crypto.randomInt(alphabet.length)];
+	}
+	return code;
+}
+
 function getStateSnapshot(includeAdminData) {
 	return {
 		isMeeting,
@@ -930,6 +958,7 @@ function getStateSnapshot(includeAdminData) {
 		sabotageEndMs,
 		sabotageChargesRemaining,
 		gameWinner,
+		playerJoinCode: includeAdminData && playerJoinCodeRequired ? playerJoinCode : undefined,
 		taskCollections: includeAdminData ? getTaskCollectionsSnapshot() : undefined,
 		selectedTaskCollectionId: includeAdminData ? selectedTaskCollectionId : undefined,
 		players: includeAdminData ? getConnectedPlayers() : undefined
@@ -980,7 +1009,8 @@ function persistState() {
 		sabotageEndMs,
 		sabotageUsedAuths: Array.from(sabotageUsedAuths),
 		sabotageChargesRemaining,
-		gameWinner
+		gameWinner,
+		playerJoinCode
 	};
 	return stateStore.write(snapshot);
 }
@@ -988,7 +1018,13 @@ function persistState() {
 function loadPersistentState() {
 	try {
 		const saved = stateStore.read();
-		if (saved === null) return;
+		if (saved === null) {
+			if (!playerJoinCode && playerJoinCodeRequired) {
+				playerJoinCode = generatePlayerJoinCode();
+				persistState();
+			}
+			return;
+		}
 		if (!isRecord(saved) || saved.version !== 1) {
 			throw new Error('Unsupported or invalid saved-state format');
 		}
@@ -1024,6 +1060,8 @@ function loadPersistentState() {
 			!Number.isFinite(saved.sabotageChargesRemaining) ||
 			(saved.gameWinner !== undefined && saved.gameWinner !== null &&
 				!['crewmates', 'impostors'].includes(saved.gameWinner)) ||
+			(saved.playerJoinCode !== undefined && saved.playerJoinCode !== null &&
+				(typeof saved.playerJoinCode !== 'string' || !saved.playerJoinCode.trim())) ||
 			!Object.values(saved.killCooldownEndMsByAuth).every(Number.isFinite) ||
 			!Object.values(saved.authToPlayer).every(player =>
 				isRecord(player) && typeof player.role === 'string' && isRecord(player.tasks)
@@ -1104,6 +1142,11 @@ function loadPersistentState() {
 		sabotageUsedAuths = new Set(Array.isArray(saved.sabotageUsedAuths) ? saved.sabotageUsedAuths : []);
 		sabotageChargesRemaining = Math.max(0, Number(saved.sabotageChargesRemaining) || 0);
 		gameWinner = ['crewmates', 'impostors'].includes(saved.gameWinner) ? saved.gameWinner : null;
+		if (playerJoinCodeRequired) {
+			playerJoinCode = typeof saved.playerJoinCode === 'string' && saved.playerJoinCode.trim()
+				? saved.playerJoinCode.trim()
+				: playerJoinCode || generatePlayerJoinCode();
+		}
 		if (isSabotageActive) {
 			sabotageTimeout = setTimeout(() => {
 				isSabotageActive = false;
@@ -1112,6 +1155,9 @@ function loadPersistentState() {
 				sabotageTimeout = null;
 				persistState();
 			}, Math.max(0, sabotageEndMs - Date.now()));
+		}
+		if (playerJoinCodeRequired && saved.playerJoinCode !== playerJoinCode) {
+			persistState();
 		}
 		console.log('[persistence] Restored saved player and game state');
 	} catch (error) {
