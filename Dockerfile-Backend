@@ -1,16 +1,20 @@
-FROM node:24-alpine
-
-RUN mkdir -p /home/node/app/data && chown -R node:node /home/node/app
+FROM dhi.io/node:24-debian13-dev AS builder
 
 WORKDIR /home/node/app
 
-COPY --chown=node:node package*.json ./
-
-USER node
+COPY package*.json ./
 
 RUN npm ci --omit=dev
 
-COPY --chown=node:node ./src ./src
+COPY ./src ./src
+RUN mkdir -p /home/node/app/data
+
+FROM dhi.io/node:24-debian13
+
+WORKDIR /home/node/app
+
+COPY --from=builder --chown=65532:65532 /home/node/app /home/node/app
+USER 65532
 
 EXPOSE 4046
 

@@ -1,4 +1,4 @@
-:80 {
+:8080 {
     route {
         # Keep the public entry point in the frontend container while
         # forwarding API and Socket.IO traffic to the backend service.
