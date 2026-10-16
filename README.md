@@ -96,11 +96,11 @@ $ npm run build:web
 $ npm start
 ```
 
-The production server serves the built React app at `/` and `/admin`.
+The production server serves the built React app at `/`, `/admin`, and `/gamemaster`.
 
 ### 4. Connect to the admin dashboard
 
-Visit `/admin` on your deployed site and enter the `ADMIN_CODE` configured on the server. The code is verified by the backend; it is not compiled into the frontend.
+Visit `/admin` on your deployed site and enter the `ADMIN_CODE` configured on the server. The code is verified by the backend; it is not compiled into the frontend. For live supervision during a round, use `/gamemaster`: it groups players by the room of their most recently completed task, includes impostor fake-task activity, and shows a live event log. This view uses the same authenticated admin session.
 
 Pressing the start button will reset task progress, assign new tasks, and assign impostors. Press it once all players connect, otherwise you will have to press it again.
 

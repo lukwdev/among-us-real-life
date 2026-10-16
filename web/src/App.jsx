@@ -1,16 +1,18 @@
 import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom'
 import Player from './pages/Player.jsx'
 import Admin from './pages/Admin.jsx'
+import Gamemaster from './pages/Gamemaster.jsx'
 import { AppBar, Box, Container, Toolbar, Typography } from '@mui/material'
 
 function Header() {
   const location = useLocation();
   const isAdmin = location.pathname.startsWith('/admin');
+  const isGamemaster = location.pathname.startsWith('/gamemaster');
 
   return (
     <AppBar position="static" color="primary">
       <Toolbar sx={{ justifyContent: 'space-between' }}>
-        <Typography variant="h6">{isAdmin ? 'Admin' : 'Player'}</Typography>
+        <Typography variant="h6">{isGamemaster ? 'Gamemaster' : isAdmin ? 'Admin' : 'Player'}</Typography>
       </Toolbar>
     </AppBar>
   );
@@ -18,7 +20,7 @@ function Header() {
 
 function AppContent() {
   const location = useLocation();
-  const isAdmin = location.pathname.startsWith('/admin');
+  const isAdmin = location.pathname.startsWith('/admin') || location.pathname.startsWith('/gamemaster');
 
   return (
     <>
@@ -41,6 +43,7 @@ function AppContent() {
           <Routes>
             <Route path="/" element={<Player />} />
             <Route path="/admin" element={<Admin />} />
+            <Route path="/gamemaster" element={<Gamemaster />} />
           </Routes>
         </Container>
       </Box>

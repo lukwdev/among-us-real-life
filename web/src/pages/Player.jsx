@@ -350,7 +350,7 @@ export default function Player() {
     const socket = socketRef.current;
     if (!socket) return;
     if (isImpostor) {
-      // Local-only toggle for impostors (UI tracking, no server emit)
+      socket.emit('impostor-task-complete', taskId, !!checked);
       setCompleted((prev) => {
         const next = { ...prev, [taskId]: !!checked };
         try {
