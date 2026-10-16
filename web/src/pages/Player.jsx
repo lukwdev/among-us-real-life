@@ -1,7 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { Alert, Backdrop, Box, Button, Card, CardContent, Checkbox, FormControlLabel, IconButton, LinearProgress, List, ListItem, ListItemText, Snackbar, Stack, TextField, Tooltip, Typography, Dialog, DialogContent, Chip } from '@mui/material';
+import {
+  Alert, Box, Button, Card, CardContent, Checkbox, FormControlLabel,
+  IconButton, LinearProgress, List, ListItem, ListItemText, Snackbar, Stack,
+  TextField, Tooltip, Typography, Dialog, DialogContent, Chip, Radio, Divider,
+  Avatar, Paper
+} from '@mui/material';
 import MapIcon from '@mui/icons-material/Map';
+import CheckCircleIcon from '@mui/icons-material/CheckCircle';
+import CampaignIcon from '@mui/icons-material/Campaign';
+import WarningAmberIcon from '@mui/icons-material/WarningAmber';
+import HowToVoteIcon from '@mui/icons-material/HowToVote';
+import WifiOffIcon from '@mui/icons-material/WifiOff';
+import jsQR from 'jsqr';
 
 function WinnerSnackbar({ winner, onClose }) {
   if (!winner) return null;
@@ -12,6 +23,334 @@ function WinnerSnackbar({ winner, onClose }) {
         {winnerName} win!
       </Alert>
     </Snackbar>
+  );
+}
+
+function MeetingOverlay({
+  open,
+  caller,
+  players,
+  authId,
+  isDead,
+  votedPlayerIds,
+  hasVoted,
+  selectedTarget,
+  onSelectTarget,
+  onConfirmVote,
+  results
+}) {
+  if (!open) return null;
+
+  const participants = (players || []).filter((p) => p.inGame !== false);
+  const living = participants.filter((p) => p.alive !== false);
+  const dead = participants.filter((p) => p.alive === false);
+
+  const isReport = caller?.type === 'report';
+
+  return (
+    <Dialog
+      open={open}
+      fullScreen
+      sx={{ zIndex: (theme) => theme.zIndex.drawer + 5 }}
+      PaperProps={{
+        sx: {
+          bgcolor: 'background.default',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          overflowY: 'auto',
+          p: { xs: 1.5, sm: 3 }
+        }
+      }}
+    >
+      <Box sx={{ width: '100%', maxWidth: 580, my: 'auto', py: 2 }}>
+
+        {/* Header Banner */}
+        <Card
+          elevation={4}
+          sx={{
+            mb: 2.5,
+            borderLeft: '4px solid',
+            borderLeftColor: isReport ? 'error.main' : 'warning.main'
+          }}
+        >
+          <CardContent>
+            <Stack spacing={0.5} alignItems="center">
+              {isReport
+                ? <WarningAmberIcon color="error" sx={{ fontSize: 40 }} />
+                : <CampaignIcon color="warning" sx={{ fontSize: 40 }} />}
+              <Typography variant="h5" fontWeight={800} letterSpacing={1}>
+                {isReport ? 'DEAD BODY REPORTED!' : 'EMERGENCY MEETING!'}
+              </Typography>
+              {caller?.name && (
+                <Typography variant="subtitle1" color="text.secondary">
+                  {isReport ? `Reported by ${caller.name}` : `Called by ${caller.name}`}
+                </Typography>
+              )}
+              <Chip
+                size="small"
+                icon={<HowToVoteIcon />}
+                label={
+                  results
+                    ? 'Voting Concluded'
+                    : `Votes Cast: ${votedPlayerIds.length} / ${living.length}`
+                }
+                color={results ? 'success' : 'default'}
+                variant="outlined"
+                sx={{ mt: 0.5 }}
+              />
+            </Stack>
+          </CardContent>
+        </Card>
+
+        {/* Voting Results View */}
+        {results ? (
+          <Stack spacing={2}>
+            {/* Ejection Announcement */}
+            <Alert
+              severity={results.ejected ? 'error' : 'info'}
+              variant="filled"
+              sx={{ borderRadius: 1 }}
+            >
+              <Typography fontWeight={700}>
+                {results.ejected
+                  ? `${results.ejectedName} was ejected.`
+                  : 'No one was ejected. (Tie or Skipped)'}
+              </Typography>
+              <Typography variant="body2" sx={{ mt: 0.5, opacity: 0.85 }}>
+                Waiting for the admin to continue the game…
+              </Typography>
+            </Alert>
+
+            {/* Vote Breakdown */}
+            <Card elevation={2}>
+              <CardContent>
+                <Typography variant="subtitle1" fontWeight={700} gutterBottom>
+                  Vote Breakdown
+                </Typography>
+                <Divider sx={{ mb: 1.5 }} />
+                <Stack spacing={1}>
+                  {/* Skip row */}
+                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ py: 0.5 }}>
+                    <Typography variant="body2" color="text.secondary" fontWeight={500}>
+                      Skip Vote
+                    </Typography>
+                    <Chip size="small" label={`${results.tallies?.['skip'] || 0}`} variant="outlined" />
+                  </Stack>
+                  {Object.entries(results.votes || {}).filter(([, tgt]) => tgt === 'skip').length > 0 && (
+                    <Typography variant="caption" color="text.secondary" sx={{ mt: -0.5, display: 'block', pl: 1 }}>
+                      {Object.entries(results.votes || {})
+                        .filter(([, tgt]) => tgt === 'skip')
+                        .map(([vid]) => (players || []).find((p) => p.id === vid)?.name || vid)
+                        .join(', ')} voted to skip
+                    </Typography>
+                  )}
+                  <Divider />
+                  {/* Player rows */}
+                  {living.map((candidate) => {
+                    const tally = results.tallies?.[candidate.id] || 0;
+                    const voters = Object.entries(results.votes || {})
+                      .filter(([, tgt]) => tgt === candidate.id)
+                      .map(([vid]) => (players || []).find((p) => p.id === vid)?.name || vid);
+                    const isEjected = results.ejected === candidate.id;
+                    return (
+                      <Box key={candidate.id}>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ py: 0.5 }}>
+                          <Stack direction="row" spacing={1} alignItems="center">
+                            <Avatar sx={{ width: 28, height: 28, fontSize: 13, bgcolor: isEjected ? 'error.dark' : 'action.selected' }}>
+                              {candidate.name.charAt(0).toUpperCase()}
+                            </Avatar>
+                            <Typography variant="body2" fontWeight={isEjected ? 700 : 500}>
+                              {candidate.name}{isEjected ? ' 💀' : ''}
+                            </Typography>
+                          </Stack>
+                          <Chip
+                            size="small"
+                            label={`${tally} ${tally === 1 ? 'vote' : 'votes'}`}
+                            color={isEjected ? 'error' : tally > 0 ? 'primary' : 'default'}
+                            variant={isEjected ? 'filled' : 'outlined'}
+                          />
+                        </Stack>
+                        {voters.length > 0 && (
+                          <Typography variant="caption" color="text.secondary" sx={{ pl: 4.5, display: 'block' }}>
+                            Voted by: {voters.join(', ')}
+                          </Typography>
+                        )}
+                      </Box>
+                    );
+                  })}
+                </Stack>
+              </CardContent>
+            </Card>
+          </Stack>
+        ) : (
+          /* Active Voting View */
+          <Stack spacing={2}>
+            {/* Status alert */}
+            <Alert
+              severity={isDead ? 'warning' : hasVoted ? 'info' : 'success'}
+              variant={isDead || hasVoted ? 'outlined' : 'filled'}
+            >
+              {isDead
+                ? 'You have been eliminated. Ghosts cannot vote.'
+                : hasVoted
+                ? 'Your vote has been recorded. Waiting for others…'
+                : 'Select a player to eject or vote to skip.'}
+            </Alert>
+
+            {/* Living Players */}
+            <Typography variant="overline" color="text.secondary">
+              Players — {living.length} alive
+            </Typography>
+
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.5 }}>
+              {living.map((player) => {
+                const isSelected = selectedTarget === player.id;
+                const playerVoted = votedPlayerIds.includes(player.id);
+                const isSelf = player.id === authId;
+                const canVote = !hasVoted && !isDead;
+
+                return (
+                  <Card
+                    key={player.id}
+                    onClick={() => { if (canVote) onSelectTarget(player.id); }}
+                    elevation={isSelected ? 6 : 1}
+                    sx={{
+                      cursor: canVote ? 'pointer' : 'default',
+                      borderLeft: '3px solid',
+                      borderLeftColor: isSelected ? 'primary.main' : 'divider',
+                      bgcolor: isSelected ? 'action.selected' : 'background.paper',
+                      transition: 'border-color 0.15s, background-color 0.15s',
+                      '&:hover': canVote ? { borderLeftColor: 'primary.main', bgcolor: 'action.hover' } : {}
+                    }}
+                  >
+                    <CardContent sx={{ py: '10px !important' }}>
+                      <Stack direction="row" spacing={1.5} alignItems="center" justifyContent="space-between">
+                        <Stack direction="row" spacing={1.5} alignItems="center" sx={{ minWidth: 0, flex: 1 }}>
+                          <Avatar
+                            sx={{
+                              width: 34,
+                              height: 34,
+                              bgcolor: isSelf ? 'secondary.dark' : 'primary.dark',
+                              fontSize: 15,
+                              fontWeight: 700
+                            }}
+                          >
+                            {player.name.charAt(0).toUpperCase()}
+                          </Avatar>
+                          <Box sx={{ minWidth: 0 }}>
+                            <Typography variant="body2" fontWeight={700} noWrap>
+                              {player.name}
+                            </Typography>
+                            {isSelf && (
+                              <Typography variant="caption" color="secondary.main" sx={{ display: 'block', lineHeight: 1 }}>
+                                (You)
+                              </Typography>
+                            )}
+                          </Box>
+                        </Stack>
+                        <Stack direction="row" spacing={0.5} alignItems="center">
+                          {playerVoted && (
+                            <CheckCircleIcon color="success" sx={{ fontSize: 20 }} />
+                          )}
+                          {canVote && (
+                            <Radio
+                              checked={isSelected}
+                              value={player.id}
+                              size="small"
+                              color="primary"
+                              sx={{ p: 0.25 }}
+                            />
+                          )}
+                        </Stack>
+                      </Stack>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+            </Box>
+
+            {/* Skip Vote Card */}
+            <Card
+              onClick={() => { if (!hasVoted && !isDead) onSelectTarget('skip'); }}
+              elevation={selectedTarget === 'skip' ? 6 : 1}
+              sx={{
+                cursor: !hasVoted && !isDead ? 'pointer' : 'default',
+                borderLeft: '3px solid',
+                borderLeftColor: selectedTarget === 'skip' ? 'secondary.main' : 'divider',
+                bgcolor: selectedTarget === 'skip' ? 'action.selected' : 'background.paper',
+                transition: 'border-color 0.15s, background-color 0.15s',
+                '&:hover': !hasVoted && !isDead ? { borderLeftColor: 'secondary.main', bgcolor: 'action.hover' } : {}
+              }}
+            >
+              <CardContent sx={{ py: '10px !important' }}>
+                <Stack direction="row" spacing={1.5} alignItems="center" justifyContent="space-between">
+                  <Stack direction="row" spacing={1.5} alignItems="center">
+                    <Avatar sx={{ width: 34, height: 34, bgcolor: 'action.selected', fontSize: 18 }}>⏭</Avatar>
+                    <Box>
+                      <Typography variant="body2" fontWeight={700}>Skip Vote</Typography>
+                      <Typography variant="caption" color="text.secondary">Don't eject anyone this round</Typography>
+                    </Box>
+                  </Stack>
+                  {!hasVoted && !isDead && (
+                    <Radio
+                      checked={selectedTarget === 'skip'}
+                      value="skip"
+                      size="small"
+                      color="secondary"
+                      sx={{ p: 0.25 }}
+                    />
+                  )}
+                </Stack>
+              </CardContent>
+            </Card>
+
+            {/* Eliminated Players */}
+            {dead.length > 0 && (
+              <>
+                <Divider />
+                <Typography variant="overline" color="error">
+                  Eliminated — {dead.length}
+                </Typography>
+                <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                  {dead.map((player) => (
+                    <Chip
+                      key={player.id}
+                      label={`💀 ${player.name}`}
+                      size="small"
+                      color="error"
+                      variant="outlined"
+                      sx={{ opacity: 0.7, textDecoration: 'line-through' }}
+                    />
+                  ))}
+                </Stack>
+              </>
+            )}
+
+            {/* Sticky confirm button */}
+            {!hasVoted && !isDead && (
+              <Box sx={{ position: 'sticky', bottom: 0, pt: 2, pb: 1, bgcolor: 'background.default', zIndex: 1 }}>
+                <Button
+                  variant="contained"
+                  color={selectedTarget === 'skip' ? 'secondary' : 'primary'}
+                  size="large"
+                  fullWidth
+                  disabled={!selectedTarget}
+                  onClick={onConfirmVote}
+                  sx={{ py: 1.5, fontWeight: 800, fontSize: '1rem' }}
+                >
+                  {selectedTarget === 'skip'
+                    ? 'Confirm — Skip Vote'
+                    : selectedTarget
+                    ? `Vote to Eject ${(players || []).find((p) => p.id === selectedTarget)?.name || 'Player'}`
+                    : 'Select a Player or Skip'}
+                </Button>
+              </Box>
+            )}
+          </Stack>
+        )}
+      </Box>
+    </Dialog>
   );
 }
 
@@ -70,6 +409,7 @@ export default function Player() {
   const [gameWinner, setGameWinner] = useState(null);
   const [isDead, setIsDead] = useState(false);
   const [isImpostor, setIsImpostor] = useState(false);
+  const [hasUsedSabotage, setHasUsedSabotage] = useState(false);
   const [killCooldownRemainingMs, setKillCooldownRemainingMs] = useState(0);
   const [mapOpen, setMapOpen] = useState(false);
   const [mapUrl, setMapUrl] = useState('');
@@ -87,6 +427,47 @@ export default function Player() {
   const swLastTickRef = useRef(0);
   const playerCodeRef = useRef(playerCode);
   playerCodeRef.current = playerCode;
+  const [playerToken, setPlayerToken] = useState(() => {
+    try {
+      return localStorage.getItem('playerSessionToken') || '';
+    } catch {
+      return '';
+    }
+  });
+  const playerTokenRef = useRef(playerToken);
+  playerTokenRef.current = playerToken;
+
+  // Voting state
+  const [playersList, setPlayersList] = useState([]);
+  const [meetingCaller, setMeetingCaller] = useState(null);
+  const [votedPlayerIds, setVotedPlayerIds] = useState([]);
+  const [hasVoted, setHasVoted] = useState(false);
+  const [selectedVoteTarget, setSelectedVoteTarget] = useState(null);
+  const [votingResults, setVotingResults] = useState(null);
+
+  // Wake Lock: keep screen awake during active game round
+  useEffect(() => {
+    if (!gameActive || !('wakeLock' in navigator)) return undefined;
+    let wakeLockSentinel = null;
+    const requestWakeLock = async () => {
+      try {
+        wakeLockSentinel = await navigator.wakeLock.request('screen');
+      } catch (err) {
+        console.debug('Wake lock request error:', err);
+      }
+    };
+    requestWakeLock();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        requestWakeLock();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      wakeLockSentinel?.release().catch(() => {});
+    };
+  }, [gameActive]);
 
   useEffect(() => {
     fetch('/api/player-auth-config')
@@ -108,13 +489,19 @@ export default function Player() {
 
     socket.on('connect', () => {
       setIsConnected(false);
-      socket.timeout(10000).emit('player-login', { name: playerName, code: playerCodeRef.current }, (timeoutError, response) => {
+      socket.timeout(10000).emit('player-login', {
+        name: playerName,
+        code: playerCodeRef.current,
+        token: playerTokenRef.current
+      }, (timeoutError, response) => {
         if (timeoutError || !response?.ok) {
           const messages = {
             'invalid-name': 'Enter a name between 1 and 32 characters.',
             'name-in-use': 'That name is already connected. Choose a different name.',
+            'unauthorized-name': 'This name is registered to another device. Choose a different name.',
             'invalid-player-code': 'The player access code is incorrect.',
             'player-code-not-configured': 'The server has not configured a player access code.',
+            'rate-limited': `Too many login attempts. Please wait ${response?.retryAfterSec ?? 120} seconds before trying again.`,
             'persistence-unavailable': 'The server could not save your player profile. Please try again later.'
           };
           if (response?.reason === 'invalid-player-code') {
@@ -125,6 +512,15 @@ export default function Player() {
             }
             setPlayerCode('');
           }
+          if (response?.reason === 'unauthorized-name') {
+            try {
+              localStorage.removeItem('playerName');
+              localStorage.removeItem('playerSessionToken');
+            } catch { /* storage is optional */ }
+            setPlayerName('');
+            setPlayerToken('');
+            playerTokenRef.current = '';
+          }
           setLoginError(messages[response?.reason] || 'Could not connect to the game. Please try again.');
           socket.disconnect();
           return;
@@ -132,6 +528,15 @@ export default function Player() {
         setLoginError('');
         setAuthId(response.id);
         setIsConnected(true);
+        if (response.token) {
+          setPlayerToken(response.token);
+          playerTokenRef.current = response.token;
+          try {
+            localStorage.setItem('playerSessionToken', response.token);
+          } catch {
+            console.warn('Could not save the player session token.');
+          }
+        }
         try {
           localStorage.setItem('playerName', response.name);
           if (playerCodeRef.current) {
@@ -168,12 +573,15 @@ export default function Player() {
       try {
         localStorage.removeItem('playerName');
         localStorage.removeItem('playerJoinCode');
+        localStorage.removeItem('playerSessionToken');
         localStorage.removeItem(`imp_completed_${authIdRef.current}`);
       } catch (error) {
         console.warn('Could not clear saved player data after roster removal.', error);
       }
       setPlayerName('');
       setNameInput('');
+      setPlayerToken('');
+      playerTokenRef.current = '';
       setAuthId('');
       setTasks({});
       setCompleted({});
@@ -242,8 +650,44 @@ export default function Player() {
       await waitMs(2000);
       await playerActionsRef.current.playSound('/sounds/sussy-boy.mp3');
     });
-    socket.on('meeting-started', () => setMeeting(true));
-    socket.on('meeting-ended', () => setMeeting(false));
+    socket.on('meeting-started', (payload) => {
+      setMeeting(true);
+      setMeetingCaller(payload?.caller || null);
+      setVotedPlayerIds([]);
+      setHasVoted(false);
+      setSelectedVoteTarget(null);
+      setVotingResults(null);
+      if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+    });
+    socket.on('meeting-ended', () => {
+      setMeeting(false);
+      setMeetingCaller(null);
+      setVotedPlayerIds([]);
+      setHasVoted(false);
+      setSelectedVoteTarget(null);
+      setVotingResults(null);
+    });
+    socket.on('meeting-state', (payload) => {
+      setMeeting(!!payload?.isMeeting);
+      if (payload?.caller) setMeetingCaller(payload.caller);
+      if (Array.isArray(payload?.votedPlayerIds)) setVotedPlayerIds(payload.votedPlayerIds);
+      if (typeof payload?.hasVoted === 'boolean') setHasVoted(payload.hasVoted);
+      if (payload?.results) setVotingResults(payload.results);
+    });
+    socket.on('vote-cast', ({ voterId }) => {
+      if (!voterId) return;
+      setVotedPlayerIds((prev) => (prev.includes(voterId) ? prev : [...prev, voterId]));
+    });
+    socket.on('voting-results', (results) => {
+      setVotingResults(results || null);
+      if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
+    });
+    socket.on('play-vote-result', async () => {
+      await playerActionsRef.current.playSound('/sounds/vote-result.mp3');
+    });
+    socket.on('players-updated', (list) => {
+      if (Array.isArray(list)) setPlayersList(list);
+    });
     socket.on('game-started', () => {
       playerActionsRef.current.stopAllSounds();
       setHasUsedSabotage(false);
@@ -253,6 +697,12 @@ export default function Player() {
       setGameWinner(null);
       setIsDead(false);
       setGameActive(true);
+      setMeeting(false);
+      setMeetingCaller(null);
+      setVotedPlayerIds([]);
+      setHasVoted(false);
+      setSelectedVoteTarget(null);
+      setVotingResults(null);
     });
     socket.on('game-ended', () => {
       playerActionsRef.current.stopAllSounds();
@@ -264,6 +714,11 @@ export default function Player() {
       setGameActive(false);
       setIsDead(false);
       setMeeting(false);
+      setMeetingCaller(null);
+      setVotedPlayerIds([]);
+      setHasVoted(false);
+      setSelectedVoteTarget(null);
+      setVotingResults(null);
       setTasks({});
       setProgress(0);
     });
@@ -275,12 +730,20 @@ export default function Player() {
       if (typeof s?.sabotageChargesRemaining === 'number') setSabotageChargesRemaining(s.sabotageChargesRemaining);
       if (typeof s?.sabotageDefusedCount === 'number') setSabotageDefusedCount(s.sabotageDefusedCount);
       if (s?.sabotageMode === 'button' || s?.sabotageMode === 'qr') setSabotageMode(s.sabotageMode);
+      if (Array.isArray(s?.players)) setPlayersList(s.players);
+      if (s?.meetingCaller) setMeetingCaller(s.meetingCaller);
+      if (Array.isArray(s?.votedPlayerIds)) setVotedPlayerIds(s.votedPlayerIds);
+      if (s?.meetingResults) setVotingResults(s.meetingResults);
     });
-    socket.on('player-dead', () => setIsDead(true));
+    socket.on('player-dead', () => {
+      setIsDead(true);
+      if (navigator.vibrate) navigator.vibrate([400, 200, 400]);
+    });
     socket.on('sabotage-started', ({ endMs }) => {
       setSabotageEndMs(endMs || 0);
       setSabotageRemainingMs(Math.max(0, (endMs || 0) - Date.now()));
       playerActionsRef.current.playLoop('/sounds/sabotage.mp3', endMs);
+      if (navigator.vibrate) navigator.vibrate([300, 200, 300, 200, 300]);
       if ('Notification' in window && Notification.permission === 'granted' &&
           !pushReadyRef.current && document.visibilityState === 'visible') {
         new Notification('Sabotage activated', {
@@ -403,6 +866,16 @@ export default function Player() {
     } catch {
       console.warn('Could not save the player access code in browser storage.');
     }
+    const storedName = (() => {
+      try { return localStorage.getItem('playerName') || ''; } catch { return ''; }
+    })();
+    if (name.toLowerCase() !== storedName.toLowerCase()) {
+      try {
+        localStorage.removeItem('playerSessionToken');
+      } catch { /* storage is optional */ }
+      setPlayerToken('');
+      playerTokenRef.current = '';
+    }
     setPlayerName(name);
     setLoginAttempt((attempt) => attempt + 1);
   }
@@ -493,8 +966,8 @@ export default function Player() {
   }
 
   async function startQrScanner(taskId) {
-    if (!('BarcodeDetector' in window) || !navigator.mediaDevices?.getUserMedia) {
-      setPushMessage('QR scanning is not supported here. Use a QR scanner keyboard or enter the value manually.');
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setPushMessage('Camera scanning is not supported on this browser/device. Enter the value manually.');
       return;
     }
     setScannerTaskId(taskId);
@@ -503,9 +976,15 @@ export default function Player() {
   useEffect(() => {
     if (!scannerTaskId) return undefined;
     let cancelled = false;
+    let animId = null;
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
     const scan = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop());
           return;
@@ -513,39 +992,88 @@ export default function Player() {
         scannerStreamRef.current = stream;
         if (scannerVideoRef.current) {
           scannerVideoRef.current.srcObject = stream;
+          scannerVideoRef.current.setAttribute('playsinline', 'true');
           await scannerVideoRef.current.play();
         }
-        const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+
+        let detector = null;
+        if ('BarcodeDetector' in window) {
+          try {
+            detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+          } catch {
+            detector = null;
+          }
+        }
+
         const tick = async () => {
           if (cancelled || !scannerVideoRef.current) return;
-          try {
-            const codes = await detector.detect(scannerVideoRef.current);
-            const value = codes[0]?.rawValue;
-            if (value) {
-              setActionInputs((previous) => ({ ...previous, [scannerTaskId]: value }));
+          const video = scannerVideoRef.current;
+          if (video.readyState >= 2) {
+            let detectedValue = null;
+
+            if (detector) {
+              try {
+                const codes = await detector.detect(video);
+                if (codes?.[0]?.rawValue) {
+                  detectedValue = codes[0].rawValue;
+                }
+              } catch {
+                // fall through to jsQR
+              }
+            }
+
+            if (!detectedValue && ctx && video.videoWidth && video.videoHeight) {
+              try {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const code = jsQR(imageData.data, imageData.width, imageData.height, {
+                  inversionAttempts: 'dontInvert'
+                });
+                if (code?.data) {
+                  detectedValue = code.data;
+                }
+              } catch (scanErr) {
+                console.debug('Frame decode failed:', scanErr);
+              }
+            }
+
+            if (detectedValue) {
+              if (scannerTaskId === '__sabotage__') {
+                setSabotageCodeInput(detectedValue);
+              } else {
+                setActionInputs((previous) => ({ ...previous, [scannerTaskId]: detectedValue }));
+              }
+              if (navigator.vibrate) navigator.vibrate(100);
               stopQrScanner();
               return;
             }
-          } catch (error) {
-            console.warn('QR detection failed.', error);
-            stopQrScanner();
-            return;
           }
-          window.requestAnimationFrame(tick);
+          animId = window.requestAnimationFrame(tick);
         };
-        tick();
+        animId = window.requestAnimationFrame(tick);
       } catch (error) {
         console.warn('Could not start QR scanner.', error);
+        setPushMessage('Could not start camera. Check permissions in browser settings.');
         stopQrScanner();
       }
     };
     scan();
     return () => {
       cancelled = true;
+      if (animId) window.cancelAnimationFrame(animId);
       scannerStreamRef.current?.getTracks().forEach((track) => track.stop());
       scannerStreamRef.current = null;
     };
   }, [scannerTaskId]);
+
+  function castVote() {
+    if (!selectedVoteTarget || hasVoted || isDead || !meeting || votingResults) return;
+    socketRef.current?.emit('cast-vote', { target: selectedVoteTarget });
+    setHasVoted(true);
+    if (navigator.vibrate) navigator.vibrate(100);
+  }
 
   async function waitMs(ms) {
     await new Promise((r) => setTimeout(r, ms));
@@ -708,7 +1236,6 @@ export default function Player() {
   playerActionsRef.current = { playLoop, playSound, stopAllSounds, stopLoop };
 
   const hasTasks = Object.keys(tasks).length > 0;
-  const [hasUsedSabotage, setHasUsedSabotage] = useState(false);
   const playerIdentity = (
     <Typography variant="subtitle2" color="text.secondary" sx={{ alignSelf: 'flex-start', px: 0.5, lineHeight: 1.2 }}>
       {playerName}
@@ -755,7 +1282,7 @@ export default function Player() {
     return (
       <Stack spacing={1} alignItems="center" sx={{ width: '100%' }}>
         {playerIdentity}
-        {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
+        {!isConnected && <Alert severity="error" icon={<WifiOffIcon />} sx={{ width: '100%', maxWidth: 420 }}>Connection lost. Reconnecting…</Alert>}
         {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
         {isConnected && pushEnabled && !pushSubscriptionSaved && (
           <Button variant="outlined" onClick={() => syncPushSubscription(socketRef.current, pushPublicKey, true)}>
@@ -791,7 +1318,7 @@ export default function Player() {
     return (
       <Stack spacing={1} alignItems="center" sx={{ width: '100%' }}>
         {playerIdentity}
-        {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
+        {!isConnected && <Alert severity="error" icon={<WifiOffIcon />} sx={{ width: '100%', maxWidth: 420 }}>Connection lost. Reconnecting…</Alert>}
         {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
         {isConnected && pushEnabled && !pushSubscriptionSaved && (
           <Button variant="outlined" onClick={() => syncPushSubscription(socketRef.current, pushPublicKey, true)}>
@@ -804,6 +1331,19 @@ export default function Player() {
             <Typography align="center">Please wait until the next round to join.</Typography>
           </CardContent>
         </Card>
+        <MeetingOverlay
+          open={meeting}
+          caller={meetingCaller}
+          players={playersList}
+          authId={authId}
+          isDead={isDead}
+          votedPlayerIds={votedPlayerIds}
+          hasVoted={hasVoted}
+          selectedTarget={selectedVoteTarget}
+          onSelectTarget={setSelectedVoteTarget}
+          onConfirmVote={castVote}
+          results={votingResults}
+        />
         <WinnerSnackbar winner={gameWinner} onClose={() => setGameWinner(null)} />
       </Stack>
     );
@@ -812,7 +1352,7 @@ export default function Player() {
   return (
     <Stack spacing={1} alignItems="center" sx={{ width: '100%' }}>
       {playerIdentity}
-      {!isConnected && <Alert severity="warning">Connection lost. Reconnecting…</Alert>}
+      {!isConnected && <Alert severity="error" icon={<WifiOffIcon />} sx={{ width: '100%', maxWidth: 420 }}>Connection lost. Reconnecting…</Alert>}
       {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
       {isConnected && pushEnabled && !pushSubscriptionSaved && (
         <Button variant="outlined" onClick={() => syncPushSubscription(socketRef.current, pushPublicKey, true)}>
@@ -889,17 +1429,26 @@ export default function Player() {
                   value={sabotageCodeInput}
                   onChange={(event) => setSabotageCodeInput(event.target.value)}
                 />
-                <Button
-                  variant="contained"
-                  color="warning"
-                  disabled={!sabotageCodeInput.trim()}
-                  onClick={() => {
-                    socketRef.current?.emit('defuse-sabotage', sabotageCodeInput.trim());
-                    setSabotageCodeInput('');
-                  }}
-                >
-                  Submit scanned QR
-                </Button>
+                <Stack direction="row" spacing={1}>
+                  <Button
+                    variant="outlined"
+                    color="inherit"
+                    onClick={() => startQrScanner('__sabotage__')}
+                  >
+                    Scan QR
+                  </Button>
+                  <Button
+                    variant="contained"
+                    color="warning"
+                    disabled={!sabotageCodeInput.trim()}
+                    onClick={() => {
+                      socketRef.current?.emit('defuse-sabotage', sabotageCodeInput.trim());
+                      setSabotageCodeInput('');
+                    }}
+                  >
+                    Submit
+                  </Button>
+                </Stack>
               </Stack>
             )}
           </Stack>
@@ -1048,9 +1597,19 @@ export default function Player() {
         </DialogContent>
       </Dialog>
 
-      <Backdrop open={meeting} sx={{ color: '#fff', zIndex: (t) => t.zIndex.drawer + 1 }}>
-        <Typography variant="h4" align="center">COME BACK FOR A MEETING</Typography>
-      </Backdrop>
+      <MeetingOverlay
+        open={meeting}
+        caller={meetingCaller}
+        players={playersList}
+        authId={authId}
+        isDead={isDead}
+        votedPlayerIds={votedPlayerIds}
+        hasVoted={hasVoted}
+        selectedTarget={selectedVoteTarget}
+        onSelectTarget={setSelectedVoteTarget}
+        onConfirmVote={castVote}
+        results={votingResults}
+      />
 
       <Dialog open={mapOpen} onClose={() => setMapOpen(false)} maxWidth="lg">
         <DialogContent sx={{ p: 0 }}>

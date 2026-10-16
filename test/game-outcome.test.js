@@ -1,6 +1,21 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { hasImpostorVictory } = require('../src/game-outcome');
+const { hasImpostorVictory, hasCrewmateVictory } = require('../src/game-outcome');
+
+test('crewmates win when all impostors are eliminated', () => {
+	assert.equal(hasCrewmateVictory({
+		impostorAuths: ['imp1', 'imp2'],
+		deadAuths: ['imp1']
+	}), false);
+	assert.equal(hasCrewmateVictory({
+		impostorAuths: ['imp1', 'imp2'],
+		deadAuths: ['imp1', 'imp2']
+	}), true);
+	assert.equal(hasCrewmateVictory({
+		impostorAuths: [],
+		deadAuths: []
+	}), false);
+});
 
 test('impostors win when they equal or outnumber the living crewmates', () => {
 	const players = {

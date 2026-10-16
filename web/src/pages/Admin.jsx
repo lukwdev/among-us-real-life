@@ -439,7 +439,8 @@ export default function Admin() {
                         'admin-not-configured': 'The server administrator has not configured ADMIN_CODE.',
                         'invalid-session': 'Your saved admin session expired. Enter the admin code to sign in again.',
                         'invalid-code': 'The admin code is incorrect.',
-                        'persistence-unavailable': 'The server could not save your admin session.'
+                        'persistence-unavailable': 'The server could not save your admin session.',
+                        'rate-limited': `Too many login attempts. Please wait ${response?.retryAfterSec ?? 120} seconds before trying again.`
                     };
                     setLoginError(messages[response?.reason] || 'The server could not verify the admin session.');
                     setAuthorized(false);
@@ -811,6 +812,18 @@ export default function Admin() {
         });
     }
 
+    function ejectPlayer(player) {
+        if (!gameActive || player.alive === false || !window.confirm(`Eliminate ${player.name}?`)) return;
+        setPlayerManagementMessage('');
+        socketRef.current?.timeout(10000).emit('admin-eject-player', { playerId: player.id }, (timeoutError, response) => {
+            if (timeoutError || !response?.ok) {
+                setPlayerManagementMessage('Could not eliminate the player.');
+                return;
+            }
+            setPlayerManagementMessage(`${player.name} was eliminated.`);
+        });
+    }
+
     async function exportBooks() {
         const token = adminSessionTokenRef.current;
         if (!token) return;
@@ -1079,14 +1092,28 @@ export default function Admin() {
                                                 label={player.connected ? 'Connected' : 'Offline'}
                                             />
                                         </Box>
-                                        <IconButton
-                                            aria-label={`Remove ${player.name}`}
-                                            color="error"
-                                            disabled={gameActive || !isConnected}
-                                            onClick={() => removePlayer(player)}
-                                        >
-                                            <DeleteIcon />
-                                        </IconButton>
+                                        {gameActive ? (
+                                            player.alive !== false && (
+                                                <Button
+                                                    size="small"
+                                                    color="error"
+                                                    variant="outlined"
+                                                    disabled={!isConnected}
+                                                    onClick={() => ejectPlayer(player)}
+                                                >
+                                                    Eliminate
+                                                </Button>
+                                            )
+                                        ) : (
+                                            <IconButton
+                                                aria-label={`Remove ${player.name}`}
+                                                color="error"
+                                                disabled={gameActive || !isConnected}
+                                                onClick={() => removePlayer(player)}
+                                            >
+                                                <DeleteIcon />
+                                            </IconButton>
+                                        )}
                                     </Stack>
                                 </Paper>
                             ))}
@@ -1128,15 +1155,29 @@ export default function Admin() {
                                                     </Typography>
                                                 </TableCell>
                                                 <TableCell>
-                                                    <IconButton
-                                                        aria-label={`Remove ${player.name}`}
-                                                        color="error"
-                                                        disabled={gameActive || !isConnected}
-                                                        onClick={() => removePlayer(player)}
-                                                        size="small"
-                                                    >
-                                                        <DeleteIcon />
-                                                    </IconButton>
+                                                    {gameActive ? (
+                                                        player.alive !== false && (
+                                                            <Button
+                                                                size="small"
+                                                                color="error"
+                                                                variant="outlined"
+                                                                disabled={!isConnected}
+                                                                onClick={() => ejectPlayer(player)}
+                                                            >
+                                                                Eliminate
+                                                            </Button>
+                                                        )
+                                                    ) : (
+                                                        <IconButton
+                                                            aria-label={`Remove ${player.name}`}
+                                                            color="error"
+                                                            disabled={gameActive || !isConnected}
+                                                            onClick={() => removePlayer(player)}
+                                                            size="small"
+                                                        >
+                                                            <DeleteIcon />
+                                                        </IconButton>
+                                                    )}
                                                 </TableCell>
                                             </TableRow>
                                         ))
@@ -1213,8 +1254,15 @@ export default function Admin() {
                             )}
                             {showContinue && (
                                 <>
-                                    <Typography variant="h5" color="error">MEETING TIME</Typography>
-                                    <Button variant="contained" onClick={continueGame} disabled={!isConnected}>Continue</Button>
+                                    <Typography variant="h5" color="error">MEETING IN PROGRESS</Typography>
+                                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                                        <Button variant="outlined" color="warning" onClick={() => socketRef.current?.emit('admin-end-voting')} disabled={!isConnected}>
+                                            End Voting & Tally
+                                        </Button>
+                                        <Button variant="contained" onClick={continueGame} disabled={!isConnected}>
+                                            Continue Game
+                                        </Button>
+                                    </Stack>
                                 </>
                             )}
                             {(gameActive || gameWinner) && (

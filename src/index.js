@@ -11,7 +11,7 @@ const { Server } = require('socket.io');
 const webPush = require('web-push');
 const { createCollectionMapRouter } = require('./collection-map-router');
 const { createGameProgress } = require('./game-progress');
-const { hasImpostorVictory } = require('./game-outcome');
+const { hasImpostorVictory, hasCrewmateVictory } = require('./game-outcome');
 const { createJsonStore } = require('./json-store');
 const { createPushNotifier } = require('./push-notifications');
 
@@ -59,7 +59,7 @@ function taskKey(task) {
 }
 
 function taskDisplayLabel(task) {
-	if (!task) return 'Unbekannter Task';
+	if (!task) return 'Unknown task';
 	return task.room ? `${task.label} (${task.room})` : task.label;
 }
 
@@ -83,21 +83,46 @@ function isValidIsbn(value) {
 	return false;
 }
 
+const isbnCache = new Map();
+
 async function lookupBookMetadata(isbn) {
-	const response = await fetch(
-		`https://openlibrary.org/api/books?bibkeys=ISBN:${encodeURIComponent(isbn)}&format=json&jscmd=data`,
-		{ headers: { Accept: 'application/json', 'User-Agent': 'among-us-real-life/1.0' } }
-	);
-	if (!response.ok) return null;
-	const data = await response.json();
-	const book = data[`ISBN:${isbn}`];
-	if (!book) return null;
-	return {
-		title: typeof book.title === 'string' ? book.title : '',
-		authors: Array.isArray(book.authors)
-			? book.authors.map(author => author.name).filter(Boolean).join(', ')
-			: ''
-	};
+	const normalized = normalizeIsbn(isbn);
+	if (isbnCache.has(normalized)) {
+		return isbnCache.get(normalized);
+	}
+	try {
+		const response = await fetch(
+			`https://openlibrary.org/api/books?bibkeys=ISBN:${encodeURIComponent(normalized)}&format=json&jscmd=data`,
+			{
+				headers: { Accept: 'application/json', 'User-Agent': 'among-us-real-life/1.0' },
+				signal: AbortSignal.timeout(5000)
+			}
+		);
+		if (!response.ok) {
+			isbnCache.set(normalized, null);
+			return null;
+		}
+		const data = await response.json();
+		const book = data[`ISBN:${normalized}`];
+		if (!book) {
+			isbnCache.set(normalized, null);
+			return null;
+		}
+		const metadata = {
+			title: typeof book.title === 'string' ? book.title : '',
+			authors: Array.isArray(book.authors)
+				? book.authors.map(author => author.name).filter(Boolean).join(', ')
+				: ''
+		};
+		if (isbnCache.size > 500) {
+			const oldestKey = isbnCache.keys().next().value;
+			isbnCache.delete(oldestKey);
+		}
+		isbnCache.set(normalized, metadata);
+		return metadata;
+	} catch {
+		return null;
+	}
 }
 
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
@@ -206,6 +231,10 @@ let gameConfig = {
 };
 let emergencyCooldownEndMs = 0;
 let lastMeetingType = null; // 'emergency' | 'report' | null
+let meetingCaller = null; // { id: string, name: string, type: 'emergency' | 'report' } | null
+let meetingVotes = Object.create(null); // voterAuth -> targetAuth | 'skip'
+let meetingResults = null; // { tallies: ..., votes: ..., ejected: ..., ejectedName: ..., tie: boolean } | null
+let impostorCompletedTasksByAuth = Object.create(null); // auth -> { [taskId]: boolean }
 let impostorIds = new Set();
 let killCooldownEndMsBySocketId = {};
 // Auth-based mappings for reconnect/rehydration
@@ -236,7 +265,33 @@ let playerDirectory = Object.create(null);
 let pushSubscriptions = Object.create(null);
 let adminSessions = Object.create(null);
 let collectionMaps = Object.create(null);
-const ADMIN_SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+const ADMIN_SESSION_DURATION_MS = Math.max(
+	1,
+	parseFloat(process.env.ADMIN_SESSION_HOURS || '24')
+) * 60 * 60 * 1000;
+
+// Rate-limit admin login attempts: max 5 attempts per 2 minutes per IP.
+const adminLoginAttempts = new Map(); // ip -> { count: number, resetAt: number }
+
+// Rate-limit player code attempts: max 10 failed attempts per 2 minutes per IP.
+const playerLoginAttempts = new Map(); // ip -> { count: number, resetAt: number }
+
+
+// Debounced persist: batches high-frequency writes to at most one disk write per 500ms using non-blocking async I/O.
+// Critical paths (login, game-start/end) still call persistState() directly.
+let _persistTimer = null;
+function schedulePersist() {
+	if (_persistTimer) return;
+	_persistTimer = setTimeout(async () => {
+		_persistTimer = null;
+		if (stateStore && typeof stateStore.writeAsync === 'function') {
+			await stateStore.writeAsync(getPersistentSnapshot());
+		} else {
+			persistState();
+		}
+	}, 500);
+}
+
 const { emitTaskProgress, getGlobalProgress } = createGameProgress({
 	io,
 	getTaskProgress: () => taskProgress
@@ -351,6 +406,23 @@ io.on('connection', socket => {
 			return reply({ ok: false, reason: 'admin-not-configured' });
 		}
 
+		// Rate-limit code-based login attempts (5 per 2 minutes per IP).
+		const loginIp = socket.handshake.address;
+		const now = Date.now();
+		const RATE_WINDOW_MS = 2 * 60 * 1000;
+		const RATE_LIMIT = 5;
+		let rateEntry = adminLoginAttempts.get(loginIp);
+		if (!rateEntry || now > rateEntry.resetAt) {
+			rateEntry = { count: 0, resetAt: now + RATE_WINDOW_MS };
+		}
+		rateEntry.count += 1;
+		adminLoginAttempts.set(loginIp, rateEntry);
+		if (rateEntry.count > RATE_LIMIT) {
+			const retryAfterSec = Math.ceil((rateEntry.resetAt - now) / 1000);
+			console.warn('[admin-login] rate-limited IP', loginIp, 'attempts:', rateEntry.count);
+			return reply({ ok: false, reason: 'rate-limited', retryAfterSec });
+		}
+
 		const submittedCode = typeof payload?.code === 'string' ? Buffer.from(payload.code) : Buffer.alloc(0);
 		const configuredCode = typeof adminCode === 'string' ? Buffer.from(adminCode) : Buffer.alloc(0);
 		const valid = submittedCode.length === configuredCode.length &&
@@ -358,6 +430,9 @@ io.on('connection', socket => {
 		if (!valid) {
 			return reply({ ok: false, reason: 'invalid-code' });
 		}
+
+		// Reset rate-limit on successful login.
+		adminLoginAttempts.delete(loginIp);
 
 		const sessionToken = crypto.randomBytes(32).toString('base64url');
 		const sessionHash = hashAdminSession(sessionToken);
@@ -378,6 +453,7 @@ io.on('connection', socket => {
 		socket.emit('global-progress', getGlobalProgress());
 		socket.emit('gamemaster-update', getGamemasterSnapshot());
 	});
+
 
 	socket.on('admin-logout', acknowledge => {
 		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
@@ -406,13 +482,29 @@ io.on('connection', socket => {
 			return reply({ ok: false, reason: 'player-code-not-configured' });
 		}
 		if (playerJoinCodeRequired) {
+			const clientIp = socket.handshake.address;
+			const now = Date.now();
+			const RATE_WINDOW_MS = 2 * 60 * 1000;
+			const PLAYER_RATE_LIMIT = 10;
+			let playerRateEntry = playerLoginAttempts.get(clientIp);
+			if (!playerRateEntry || now > playerRateEntry.resetAt) {
+				playerRateEntry = { count: 0, resetAt: now + RATE_WINDOW_MS };
+			}
+			if (playerRateEntry.count >= PLAYER_RATE_LIMIT) {
+				const retryAfterSec = Math.ceil((playerRateEntry.resetAt - now) / 1000);
+				return reply({ ok: false, reason: 'rate-limited', retryAfterSec });
+			}
+
 			const submittedCode = typeof payload?.code === 'string' ? Buffer.from(payload.code) : Buffer.alloc(0);
 			const configuredCode = Buffer.from(playerJoinCode);
 			const valid = submittedCode.length === configuredCode.length &&
 				crypto.timingSafeEqual(submittedCode, configuredCode);
 			if (!valid) {
+				playerRateEntry.count += 1;
+				playerLoginAttempts.set(clientIp, playerRateEntry);
 				return reply({ ok: false, reason: 'invalid-player-code' });
 			}
+			playerLoginAttempts.delete(clientIp);
 		}
 		if (!name || name.length > 32 || /[\u0000-\u001f\u007f]/.test(name)) {
 			return reply({ ok: false, reason: 'invalid-name' });
@@ -424,30 +516,48 @@ io.on('connection', socket => {
 			return reply({ ok: false, reason: 'name-in-use' });
 		}
 
+		const token = typeof payload?.token === 'string' && payload.token.trim() ? payload.token.trim() : null;
 		const existingPlayer = playerDirectory[playerKey];
 		if (!existingPlayer) {
-			playerDirectory[playerKey] = { id: playerKey, name, lastSeenMs: Date.now() };
+			const playerToken = token || crypto.randomUUID();
+			playerDirectory[playerKey] = { id: playerKey, name, token: playerToken, lastSeenMs: Date.now() };
 			if (!persistState()) {
 				delete playerDirectory[playerKey];
 				return reply({ ok: false, reason: 'persistence-unavailable' });
 			}
-		} else if (existingPlayer.name !== name) {
-			const previousName = existingPlayer.name;
-			existingPlayer.name = name;
-			if (!persistState()) {
-				existingPlayer.name = previousName;
-				return reply({ ok: false, reason: 'persistence-unavailable' });
+		} else {
+			// If an existing player has a session token, incoming request must supply it
+			if (existingPlayer.token && (!token || token !== existingPlayer.token)) {
+				return reply({ ok: false, reason: 'unauthorized-name' });
+			}
+			// Legacy support: if player had no token stored in previous state, initialize it
+			if (!existingPlayer.token) {
+				existingPlayer.token = token || crypto.randomUUID();
+			}
+			if (existingPlayer.name !== name) {
+				const previousName = existingPlayer.name;
+				existingPlayer.name = name;
+				if (!persistState()) {
+					existingPlayer.name = previousName;
+					return reply({ ok: false, reason: 'persistence-unavailable' });
+				}
 			}
 		}
 
 		socket.data.playerId = playerKey;
+		socket.data.playerToken = playerDirectory[playerKey].token;
 		socketIdToAuth[socket.id] = playerKey;
-		reply({ ok: true, id: playerKey, name: playerDirectory[playerKey].name });
+		reply({
+			ok: true,
+			id: playerKey,
+			name: playerDirectory[playerKey].name,
+			token: playerDirectory[playerKey].token
+		});
 		socket.emit('state', getStateSnapshot(false));
 		sendPlayerSnapshot(socket, playerKey);
 		broadcastPlayersToAdmins();
 		broadcastGamemasterUpdate();
-		appendGameLog('player-login', `${name} ist beigetreten`, { playerId: playerKey });
+		appendGameLog('player-login', `${name} joined the game`, { playerId: playerKey });
 		console.log('[player-login]', { socketId: socket.id, playerId: playerKey });
 	});
 
@@ -780,8 +890,12 @@ io.on('connection', socket => {
 		const playerTasks = Object.create(null);
 		taskProgress = {};
 		taskActivityByAuth = Object.create(null);
+		impostorCompletedTasksByAuth = Object.create(null);
+		meetingCaller = null;
+		meetingVotes = Object.create(null);
+		meetingResults = null;
 		gameLog = [];
-		appendGameLog('game-started', 'Spiel gestartet', { players: uniqueAuths.length, impostors: impostorAuths.size });
+		appendGameLog('game-started', 'Game started', { players: uniqueAuths.length, impostors: impostorAuths.size });
 		for (const a of uniqueAuths) {
 			playerTaskLabels[a] = new Set();
 			playerTasks[a] = {};
@@ -863,34 +977,117 @@ io.on('connection', socket => {
 
 	socket.on('report', () => {
 		if (!socket.data.playerId || !isGameActive || isMeeting) return;
-		if (deadAuths.has(socketIdToAuth[socket.id])) return;
+		const callerAuth = socketIdToAuth[socket.id];
+		if (!callerAuth || deadAuths.has(callerAuth)) return;
+		// Cancel sabotage if active upon finding a dead body (Among Us rule)
+		if (isSabotageActive) {
+			isSabotageActive = false;
+			sabotageEndMs = 0;
+			if (sabotageTimeout) {
+				clearTimeout(sabotageTimeout);
+				sabotageTimeout = null;
+			}
+			io.emit('sabotage-ended', { reason: 'meeting' });
+			appendGameLog('sabotage-cleared', 'Sabotage cleared by reported body');
+		}
 		isMeeting = true;
 		lastMeetingType = 'report';
+		const callerName = playerDirectory[callerAuth]?.name || callerAuth;
+		meetingCaller = { id: callerAuth, name: callerName, type: 'report' };
+		meetingVotes = Object.create(null);
+		meetingResults = null;
 		io.emit('play-meeting');
-		io.emit('meeting-started');
-		void sendPushNotification('Meeting called', 'Return to the game now.', 'among-us-meeting');
+		io.emit('meeting-started', { caller: meetingCaller });
+		void sendPushNotification('Dead body reported', `${callerName} reported a body. Return for the meeting.`, 'among-us-meeting');
 		persistState();
-		console.log('[report]', { socketId: socket.id, auth: socketIdToAuth[socket.id] });
-		appendGameLog('meeting', 'Meeting durch Report gestartet');
+		console.log('[report]', { socketId: socket.id, auth: callerAuth });
+		appendGameLog('meeting', `Dead body reported by ${callerName}`, { callerId: callerAuth });
+		broadcastGamemasterUpdate();
 	});
 
 	socket.on('emergency-meeting', () => {
 		if ((!socket.data.playerId && !isAuthenticatedAdmin(socket)) || !isGameActive || isMeeting) return;
-		if (socket.data.playerId && deadAuths.has(socketIdToAuth[socket.id])) return;
+		const callerAuth = socketIdToAuth[socket.id];
+		if (socket.data.playerId && deadAuths.has(callerAuth)) return;
 		if (Date.now() < emergencyCooldownEndMs) return;
+		if (isSabotageActive) return; // Emergency meetings blocked while sabotage is active
 		isMeeting = true;
 		lastMeetingType = 'emergency';
+		const callerName = socket.data.playerId ? (playerDirectory[callerAuth]?.name || callerAuth) : 'Admin';
+		meetingCaller = { id: callerAuth || 'admin', name: callerName, type: 'emergency' };
+		meetingVotes = Object.create(null);
+		meetingResults = null;
 		io.emit('play-meeting');
-		io.emit('meeting-started');
-		void sendPushNotification('Emergency meeting', 'Return to the game now.', 'among-us-meeting');
+		io.emit('meeting-started', { caller: meetingCaller });
+		void sendPushNotification('Emergency meeting', `${callerName} called an emergency meeting.`, 'among-us-meeting');
 		persistState();
-		console.log('[emergency-meeting]', { socketId: socket.id, auth: socketIdToAuth[socket.id] });
-		appendGameLog('meeting', 'Emergency Meeting gestartet');
+		console.log('[emergency-meeting]', { socketId: socket.id, auth: callerAuth });
+		appendGameLog('meeting', `Emergency meeting called by ${callerName}`, { callerId: callerAuth });
+		broadcastGamemasterUpdate();
+	});
+
+	socket.on('cast-vote', payload => {
+		if (!socket.data.playerId || !isGameActive || !isMeeting || meetingResults) return;
+		const voterAuth = socketIdToAuth[socket.id];
+		if (!voterAuth || deadAuths.has(voterAuth)) return;
+		if (meetingVotes[voterAuth]) return;
+
+		const target = typeof payload?.target === 'string' ? payload.target.trim() : '';
+		const livingPlayers = Object.keys(authToPlayer).filter(id => !deadAuths.has(id));
+		if (target !== 'skip' && !livingPlayers.includes(target)) return;
+
+		meetingVotes[voterAuth] = target;
+		io.emit('vote-cast', { voterId: voterAuth, totalVotes: Object.keys(meetingVotes).length });
+		schedulePersist();
+		console.log('[cast-vote]', { voter: voterAuth, target });
+
+		const allLiving = Object.keys(authToPlayer).filter(id => !deadAuths.has(id));
+		if (allLiving.length > 0 && allLiving.every(id => meetingVotes[id])) {
+			concludeVoting();
+		}
+	});
+
+	socket.on('admin-end-voting', () => {
+		if (!isAuthenticatedAdmin(socket) || !isGameActive || !isMeeting || meetingResults) return;
+		concludeVoting();
+	});
+
+	socket.on('admin-eject-player', (payload, acknowledge) => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		if (!isAuthenticatedAdmin(socket) || !isGameActive) return reply({ ok: false, reason: 'unauthorized' });
+		const playerId = typeof payload?.playerId === 'string' ? payload.playerId : '';
+		if (!playerId || !authToPlayer[playerId] || deadAuths.has(playerId)) {
+			return reply({ ok: false, reason: 'invalid-player' });
+		}
+		deadAuths.add(playerId);
+		if (!impostorAuths.has(playerId)) {
+			deadTaskNextCompletionAtByAuth[playerId] = Date.now() +
+				Math.max(1, Number(gameConfig.deadTaskCompletionIntervalSeconds || 90)) * 1000;
+			scheduleDeadTaskCompletion(playerId);
+		}
+		for (const s of io.of('/').sockets.values()) {
+			if (s.data.playerId === playerId) {
+				s.emit('player-dead');
+			}
+		}
+		appendGameLog('player-ejected', `${playerDirectory[playerId]?.name || playerId} was eliminated by admin.`, { playerId });
+		broadcastPlayersToAdmins();
+		broadcastGamemasterUpdate();
+		persistState();
+		if (hasCrewmateVictory({ impostorAuths, deadAuths })) {
+			finishGame('crewmates');
+		} else if (hasImpostorVictory({ players: authToPlayer, impostorAuths, deadAuths })) {
+			finishGame('impostors');
+		}
+		reply({ ok: true });
 	});
 
 	socket.on('continue-game', () => {
 		if (!isAuthenticatedAdmin(socket) || !isGameActive) return;
 		isMeeting = false;
+		meetingCaller = null;
+		meetingVotes = Object.create(null);
+		meetingResults = null;
 		// Reset kill cooldown for all impostors at the end of a meeting
 		const killMs = Math.max(0, (gameConfig.killCooldownSeconds || 0) * 1000);
 		const now = Date.now();
@@ -911,7 +1108,8 @@ io.on('connection', socket => {
 		io.emit('cooldown-updated', { emergencyCooldownEndMs });
 		persistState();
 		console.log('[meeting-ended]', { emergencyCooldownEndMs });
-		appendGameLog('meeting-ended', 'Meeting beendet');
+		appendGameLog('meeting-ended', 'Meeting ended');
+		broadcastGamemasterUpdate();
 	});
 
 	socket.on('end-game', () => {
@@ -944,6 +1142,10 @@ io.on('connection', socket => {
 			}
 		}
 		taskProgress = Object.create(null);
+		meetingCaller = null;
+		meetingVotes = Object.create(null);
+		meetingResults = null;
+		impostorCompletedTasksByAuth = Object.create(null);
 		gameWinner = null;
 		emitTaskProgress();
 		io.emit('game-ended');
@@ -968,9 +1170,9 @@ io.on('connection', socket => {
 		const a = socketIdToAuth[socket.id];
 		if (a) killCooldownEndMsByAuth[a] = killCooldownEndMsBySocketId[socket.id];
 		socket.emit('kill-cooldown-updated', { endMs: killCooldownEndMsBySocketId[socket.id] });
-		persistState();
+		schedulePersist();
 		console.log('[kill]', { socketId: socket.id, auth: a, endMs: killCooldownEndMsBySocketId[socket.id] });
-		appendGameLog('kill', 'Impostor-Aktion erkannt', { playerId: a });
+		appendGameLog('kill', 'Impostor action registered', { playerId: a });
 	});
 
 	// Impostor sabotage attempt (one-time per impostor)
@@ -999,8 +1201,8 @@ io.on('connection', socket => {
 		);
 		// Also inform this impostor they've used their sabotage
 		socket.emit('sabotage-usage', { used: true });
-		persistState();
-		appendGameLog('sabotage', 'Sabotage gestartet', { playerId: a });
+		schedulePersist();
+		appendGameLog('sabotage', 'Sabotage activated', { playerId: a });
 		if (sabotageTimeout) clearTimeout(sabotageTimeout);
 		sabotageTimeout = setTimeout(() => {
 			sabotageTimeout = null;
@@ -1031,7 +1233,7 @@ io.on('connection', socket => {
 				.map(value => value.includes(':') ? value.slice(value.indexOf(':') + 1) : value));
 			io.emit('sabotage-progress', { completed: distinctCodes.size, required: 2 });
 			if (distinctCodes.size < 2) {
-				persistState();
+				schedulePersist();
 				return;
 			}
 		} else {
@@ -1047,19 +1249,20 @@ io.on('connection', socket => {
 		if (sabotageTimeout) clearTimeout(sabotageTimeout);
 		sabotageTimeout = null;
 		io.emit('sabotage-ended', { reason: 'defused' });
-		const defuserNames = Array.from(sabotageDefuserAuths)
-			.map(auth => playerDirectory[auth]?.name || auth);
+		const defuserPlayerIds = Array.from(new Set(Array.from(sabotageDefuserAuths)
+			.map(entry => entry.includes(':') ? entry.split(':')[0] : entry)));
+		const defuserNames = defuserPlayerIds.map(entry => playerDirectory[entry]?.name || entry);
 		void sendPushNotification(
 			'Sabotage defused',
-			'The sabotage was successfully defused by two players.',
+			'The sabotage was successfully defused.',
 			'among-us-sabotage-defused'
 		);
 		persistState();
-		console.log('[sabotage-defused]', { auths: Array.from(sabotageDefuserAuths) });
+		console.log('[sabotage-defused]', { auths: defuserPlayerIds });
 		appendGameLog(
 			'sabotage-defused',
-			`Sabotage entschärft von ${defuserNames.join(' und ')}`,
-			{ playerIds: Array.from(sabotageDefuserAuths), playerNames: defuserNames }
+			`Sabotage defused by ${defuserNames.join(' and ')}`,
+			{ playerIds: defuserPlayerIds, playerNames: defuserNames }
 		);
 	});
 
@@ -1080,7 +1283,7 @@ io.on('connection', socket => {
 		if (isNewlyCompleted && progress.total > 0 && progress.completed === progress.total) {
 			finishGame('crewmates');
 		}
-		persistState();
+		schedulePersist();
 		broadcastGamemasterUpdate();
 	});
 
@@ -1167,7 +1370,7 @@ io.on('connection', socket => {
 		if (isNewlyCompleted && getGlobalProgress().total > 0 && getGlobalProgress().completed === getGlobalProgress().total) {
 			finishGame('crewmates');
 		}
-		persistState();
+		schedulePersist();
 		broadcastGamemasterUpdate();
 	});
 
@@ -1208,7 +1411,7 @@ io.on('connection', socket => {
 			getGlobalProgress().completed === getGlobalProgress().total) {
 			finishGame('crewmates');
 		}
-		persistState();
+		schedulePersist();
 		broadcastGamemasterUpdate();
 	});
 
@@ -1239,7 +1442,7 @@ io.on('connection', socket => {
 		socket.emit('tasks-completed', getCompletionMapForAuth(auth));
 		reply({ ok: true });
 		emitTaskProgress();
-		persistState();
+		schedulePersist();
 		broadcastGamemasterUpdate();
 	});
 
@@ -1254,7 +1457,7 @@ io.on('connection', socket => {
 		emitTaskProgress();
 		console.log('[task-incomplete]', { socketId: socket.id, auth, taskId });
 		socket.emit('tasks-completed', getCompletionMapForAuth(auth));
-		persistState();
+		schedulePersist();
 		broadcastGamemasterUpdate();
 	});
 
@@ -1262,9 +1465,12 @@ io.on('connection', socket => {
 		if (!socket.data.playerId || isMeeting || !isGameActive) return;
 		const auth = socketIdToAuth[socket.id];
 		if (!auth || !impostorAuths.has(auth) || !authToPlayer[auth]?.tasks?.[taskId]) return;
+		if (!impostorCompletedTasksByAuth[auth]) impostorCompletedTasksByAuth[auth] = Object.create(null);
+		impostorCompletedTasksByAuth[auth][taskId] = completed !== false;
 		recordTaskActivity(auth, taskId, completed !== false);
-		persistState();
+		schedulePersist();
 		broadcastGamemasterUpdate();
+		socket.emit('tasks-completed', getCompletionMapForAuth(auth));
 	});
 
     // NEW: Player marks themselves as dead
@@ -1285,10 +1491,15 @@ io.on('connection', socket => {
         // Broadcast updated player list and alive count
         broadcastPlayersToAdmins();
         broadcastAliveCount();
-        appendGameLog('player-dead', 'Spieler ausgeschieden', { playerId: auth });
+        appendGameLog('player-dead', `${playerDirectory[auth]?.name || auth} was eliminated`, { playerId: auth });
         broadcastGamemasterUpdate();
 		socket.emit('player-dead');
-		if (hasImpostorVictory({
+		if (hasCrewmateVictory({
+			impostorAuths,
+			deadAuths
+		})) {
+			finishGame('crewmates');
+		} else if (hasImpostorVictory({
 			players: authToPlayer,
 			impostorAuths,
 			deadAuths
@@ -1302,14 +1513,91 @@ io.on('connection', socket => {
 		const playerId = socket.data.playerId;
 		if (playerId && playerDirectory[playerId]) {
 			playerDirectory[playerId].lastSeenMs = Date.now();
-			persistState();
+			schedulePersist();
 		}
 		delete socketIdToAuth[socket.id];
 		broadcastPlayersToAdmins();
 		broadcastGamemasterUpdate();
-		if (playerId) appendGameLog('player-disconnect', `${playerDirectory[playerId]?.name || playerId} getrennt`, { playerId });
+		if (playerId) appendGameLog('player-disconnect', `${playerDirectory[playerId]?.name || playerId} disconnected`, { playerId });
 	});
 });
+
+function concludeVoting() {
+	if (!isMeeting || meetingResults) return;
+
+	const tallies = Object.create(null);
+	tallies['skip'] = 0;
+	const livingPlayers = Object.keys(authToPlayer).filter(id => !deadAuths.has(id));
+	for (const id of livingPlayers) {
+		tallies[id] = 0;
+	}
+	for (const target of Object.values(meetingVotes)) {
+		if (tallies[target] !== undefined) tallies[target] += 1;
+		else tallies[target] = 1;
+	}
+
+	let maxVotes = 0;
+	let topCandidate = null;
+	let isTie = false;
+
+	for (const [candidate, count] of Object.entries(tallies)) {
+		if (count > maxVotes) {
+			maxVotes = count;
+			topCandidate = candidate;
+			isTie = false;
+		} else if (count === maxVotes && maxVotes > 0) {
+			isTie = true;
+		}
+	}
+
+	let ejected = null;
+	let ejectedName = null;
+
+	if (topCandidate && topCandidate !== 'skip' && !isTie && maxVotes > 0) {
+		ejected = topCandidate;
+		ejectedName = playerDirectory[ejected]?.name || ejected;
+		deadAuths.add(ejected);
+
+		if (!impostorAuths.has(ejected)) {
+			deadTaskNextCompletionAtByAuth[ejected] = Date.now() +
+				Math.max(1, Number(gameConfig.deadTaskCompletionIntervalSeconds || 90)) * 1000;
+			scheduleDeadTaskCompletion(ejected);
+		}
+
+		for (const s of io.of('/').sockets.values()) {
+			if (s.data.playerId === ejected) {
+				s.emit('player-dead');
+			}
+		}
+	}
+
+	meetingResults = {
+		tallies,
+		votes: meetingVotes,
+		ejected,
+		ejectedName,
+		tie: isTie || topCandidate === 'skip' || maxVotes === 0
+	};
+
+	io.emit('voting-results', meetingResults);
+	io.emit('play-vote-result');
+
+	if (ejected) {
+		appendGameLog('player-ejected', `${ejectedName} was ejected.`, { playerId: ejected });
+	} else {
+		appendGameLog('voting-tie', 'No one was ejected (Skipped or tie).');
+	}
+
+	broadcastPlayersToAdmins();
+	broadcastGamemasterUpdate();
+	persistState();
+
+	if (hasCrewmateVictory({ impostorAuths, deadAuths })) {
+		finishGame('crewmates');
+	} else if (hasImpostorVictory({ players: authToPlayer, impostorAuths, deadAuths })) {
+		finishGame('impostors');
+	}
+}
 
 function finishGame(winner) {
 	if (!isGameActive || gameWinner || !['crewmates', 'impostors'].includes(winner)) return;
@@ -1322,7 +1610,9 @@ function finishGame(winner) {
 		winner,
 		title: `${winnerName} win!`,
 		body: winner === 'crewmates'
-			? 'All crew tasks have been completed.'
+			? (hasCrewmateVictory({ impostorAuths, deadAuths })
+				? 'All impostors have been eliminated.'
+				: 'All crew tasks have been completed.')
 			: 'The impostors outnumber the remaining crewmates.'
 	};
 	persistState();
@@ -1330,7 +1620,7 @@ function finishGame(winner) {
 	io.emit('state', getStateSnapshot(false));
 	void sendPushNotification(notification.title, notification.body, 'among-us-game-won');
 	console.log('[game-won]', { winner });
-	appendGameLog('game-won', `${winnerName} gewinnen`, { winner });
+	appendGameLog('game-won', `${winnerName} win!`, { winner });
 	persistState();
 	broadcastGamemasterUpdate();
 }
@@ -1373,7 +1663,7 @@ function scheduleDeadTaskCompletion(auth) {
 			.find(taskId => taskProgress[taskId] === false);
 		if (!isGameActive || !deadAuths.has(auth) || !nextTaskId) {
 			delete deadTaskNextCompletionAtByAuth[auth];
-			persistState();
+			schedulePersist();
 			return;
 		}
 
@@ -1381,7 +1671,7 @@ function scheduleDeadTaskCompletion(auth) {
 		recordTaskActivity(auth, nextTaskId, true);
 		delete deadTaskNextCompletionAtByAuth[auth];
 		emitTaskProgress();
-		persistState();
+		schedulePersist();
 		console.log('[dead-task-complete]', { auth, taskId: nextTaskId });
 
 		const playerSocket = Array.from(io.of('/').sockets.values())
@@ -1397,7 +1687,7 @@ function scheduleDeadTaskCompletion(auth) {
 		if (isGameActive) {
 			deadTaskNextCompletionAtByAuth[auth] = Date.now() + intervalMs;
 			scheduleDeadTaskCompletion(auth);
-			persistState();
+			schedulePersist();
 		}
 	}, Math.max(0, nextAt - Date.now()));
 	deadTaskCompletionTimers.set(auth, timer);
@@ -1413,12 +1703,17 @@ function getStateSnapshot(includeAdminData) {
 		sabotageEndMs,
 		sabotageMode: gameConfig.sabotageMode,
 		sabotageChargesRemaining,
-		sabotageDefusedCount: sabotageDefuserAuths.size,
+		sabotageDefusedCount: gameConfig.sabotageMode === 'qr'
+			? new Set(Array.from(sabotageDefuserAuths).map(v => v.includes(':') ? v.slice(v.indexOf(':') + 1) : v)).size
+			: sabotageDefuserAuths.size,
 		gameWinner,
+		meetingCaller,
+		votedPlayerIds: Object.keys(meetingVotes),
+		meetingResults,
 		playerJoinCode: includeAdminData && playerJoinCodeRequired ? playerJoinCode : undefined,
 		taskCollections: includeAdminData ? getTaskCollectionsSnapshot() : undefined,
 		selectedTaskCollectionId: includeAdminData ? selectedTaskCollectionId : undefined,
-		players: includeAdminData ? getConnectedPlayers() : undefined
+		players: getConnectedPlayers()
 	};
 }
 
@@ -1443,7 +1738,7 @@ function getGamemasterSnapshot() {
 			connected,
 			alive: !deadAuths.has(player.id),
 			role: isGameActive && info.role ? info.role : '',
-			currentRoom: roomMatch || (latestTask ? 'Raum nicht angegeben' : 'Noch kein Task'),
+			currentRoom: roomMatch || (latestTask ? 'No room specified' : 'No tasks yet'),
 			lastTask: latestTask ? taskDisplayLabel(latestTask) : null,
 			lastTaskAt: activity?.completedAt || null
 		};
@@ -1461,7 +1756,7 @@ function recordTaskActivity(auth, taskId, completed) {
 	};
 	if (completed) {
 		const label = taskDisplayLabel(authToPlayer[auth]?.tasks?.[taskId]);
-		appendGameLog('task-complete', `${playerDirectory[auth]?.name || auth} erledigt: ${label}`, { playerId: auth, taskId, impostor: impostorAuths.has(auth) });
+		appendGameLog('task-complete', `${playerDirectory[auth]?.name || auth} completed: ${label}`, { playerId: auth, taskId, impostor: impostorAuths.has(auth) });
 	}
 }
 
@@ -1525,10 +1820,19 @@ function sendPlayerSnapshot(socket, playerId) {
 		killCooldownEndMsBySocketId[socket.id] = endMs;
 		socket.emit('kill-cooldown-updated', { endMs });
 	}
+	if (isMeeting) {
+		socket.emit('meeting-state', {
+			isMeeting: true,
+			caller: meetingCaller,
+			votedPlayerIds: Object.keys(meetingVotes),
+			hasVoted: Boolean(meetingVotes[playerId]),
+			results: meetingResults
+		});
+	}
 }
 
-function persistState() {
-	const snapshot = {
+function getPersistentSnapshot() {
+	return {
 		version: 1,
 		adminSessions,
 		collectionMaps,
@@ -1543,6 +1847,10 @@ function persistState() {
 		isGameActive,
 		emergencyCooldownEndMs,
 		lastMeetingType,
+		meetingCaller,
+		meetingVotes,
+		meetingResults,
+		impostorCompletedTasksByAuth,
 		impostorAuths: Array.from(impostorAuths),
 		killCooldownEndMsByAuth,
 		deadAuths: Array.from(deadAuths),
@@ -1559,7 +1867,10 @@ function persistState() {
 		gameLog,
 		playerJoinCode
 	};
-	return stateStore.write(snapshot);
+}
+
+function persistState() {
+	return stateStore.write(getPersistentSnapshot());
 }
 
 function loadPersistentState() {
@@ -1587,7 +1898,8 @@ function loadPersistentState() {
 			!Array.isArray(saved.gameConfig.tasks) ||
 			!saved.gameConfig.tasks.every(task => typeof task === 'string' || isValidTask(task)) ||
 			!Object.entries(saved.playerDirectory).every(([id, player]) =>
-				isRecord(player) && player.id === id && typeof player.name === 'string' && player.name.trim()
+				isRecord(player) && player.id === id && typeof player.name === 'string' && player.name.trim() &&
+				(player.token === undefined || typeof player.token === 'string')
 			) ||
 			!Object.values(saved.taskProgress).every(value => typeof value === 'boolean') ||
 			saved.impostorAuths.concat(
@@ -1725,6 +2037,10 @@ function loadPersistentState() {
 				? saved.playerJoinCode.trim()
 				: playerJoinCode || generatePlayerJoinCode();
 		}
+		meetingCaller = isRecord(saved.meetingCaller) ? saved.meetingCaller : null;
+		meetingVotes = isRecord(saved.meetingVotes) ? saved.meetingVotes : Object.create(null);
+		meetingResults = isRecord(saved.meetingResults) ? saved.meetingResults : null;
+		impostorCompletedTasksByAuth = isRecord(saved.impostorCompletedTasksByAuth) ? saved.impostorCompletedTasksByAuth : Object.create(null);
 		if (isSabotageActive) {
 			const remainingMs = sabotageEndMs - Date.now();
 			if (remainingMs <= 0) {
@@ -1752,6 +2068,15 @@ function loadPersistentState() {
 		console.log('[persistence] Restored saved player and game state');
 	} catch (error) {
 		console.error('[persistence] Unable to load saved game state; starting with defaults:', error);
+		try {
+			if (fs.existsSync(STATE_FILE)) {
+				const backupPath = `${STATE_FILE}.corrupt-${Date.now()}`;
+				fs.copyFileSync(STATE_FILE, backupPath);
+				console.warn(`[persistence] Backed up corrupted state file to ${backupPath}`);
+			}
+		} catch (backupError) {
+			console.error('[persistence] Failed to backup corrupt state file:', backupError);
+		}
 	}
 }
 
@@ -1847,6 +2172,13 @@ function getCompletionMapForAuth(a) {
 	const info = authToPlayer[a];
 	const result = {};
 	if (!info || !info.tasks) return result;
+	if (impostorAuths.has(a)) {
+		const impMap = impostorCompletedTasksByAuth[a] || {};
+		for (const taskId of Object.keys(info.tasks)) {
+			result[taskId] = !!impMap[taskId];
+		}
+		return result;
+	}
 	for (const taskId of Object.keys(info.tasks)) {
 		result[taskId] = !!taskProgress[taskId];
 	}
@@ -1864,18 +2196,15 @@ function getConnectedPlayers() {
 			id: player.id,
 			name: player.name,
 			connected: connectedPlayerIds.has(player.id),
-			alive: !deadAuths.has(player.id)
+			alive: !deadAuths.has(player.id),
+			inGame: isGameActive ? Boolean(authToPlayer[player.id]) : true
 		}))
 		.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function broadcastPlayersToAdmins() {
 	const players = getConnectedPlayers();
-	for (const socket of io.of('/').sockets.values()) {
-		if (isAuthenticatedAdmin(socket)) {
-			socket.emit('players-updated', players);
-		}
-	}
+	io.emit('players-updated', players);
 }
 
 function broadcastAdminState() {

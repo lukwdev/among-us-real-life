@@ -14,4 +14,12 @@ function hasImpostorVictory({ players, impostorAuths, deadAuths }) {
 	return livingImpostors > 0 && livingImpostors >= livingCrew;
 }
 
-module.exports = { hasImpostorVictory };
+function hasCrewmateVictory({ impostorAuths, deadAuths }) {
+	const impostorSet = new Set(impostorAuths);
+	const deadSet = new Set(deadAuths);
+	if (impostorSet.size === 0) return false;
+	const livingImpostors = Array.from(impostorSet).filter(auth => !deadSet.has(auth));
+	return livingImpostors.length === 0;
+}
+
+module.exports = { hasImpostorVictory, hasCrewmateVictory };
