@@ -15,6 +15,91 @@ const { hasImpostorVictory } = require('./game-outcome');
 const { createJsonStore } = require('./json-store');
 const { createPushNotifier } = require('./push-notifications');
 
+function normalizeTask(task, index = 0) {
+	if (typeof task === 'string') {
+		const match = /^(.*)\s+\(([^()]*)\)$/.exec(task.trim());
+		return {
+			id: `legacy-${index}-${crypto.createHash('sha1').update(task).digest('hex').slice(0, 10)}`,
+			label: (match ? match[1] : task).trim(),
+			room: match ? match[2].trim() : '',
+			type: 'manual'
+		};
+	}
+	const normalized = {
+		id: typeof task?.id === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(task.id)
+			? task.id
+			: crypto.randomUUID(),
+		label: typeof task?.label === 'string' ? task.label.trim() : '',
+		room: typeof task?.room === 'string' ? task.room.trim() : '',
+		type: ['manual', 'qr', 'isbn'].includes(task?.type) ? task.type : 'manual'
+	};
+	if (normalized.type === 'qr') {
+		normalized.qrCodes = Array.isArray(task.qrCodes)
+			? task.qrCodes.filter(code => typeof code === 'string').map(code => code.trim()).filter(Boolean)
+			: [];
+	}
+	if (normalized.type === 'isbn') normalized.isbnCount = Math.max(1, Math.floor(Number(task.isbnCount) || 1));
+	return normalized;
+}
+
+function isValidTask(task) {
+	if (typeof task === 'string') return task.trim().length > 0 && task.trim().length <= 200;
+	const normalized = normalizeTask(task);
+	return isRecord(task) &&
+		typeof normalized.label === 'string' &&
+		normalized.label.length > 0 &&
+		normalized.label.length <= 200 &&
+		normalized.room.length <= 64 &&
+		(normalized.type !== 'qr' || (normalized.qrCodes.length >= 1 && normalized.qrCodes.length <= 20)) &&
+		(normalized.type !== 'isbn' || normalized.isbnCount <= 1000);
+}
+
+function taskKey(task) {
+	return task.id || `${task.type}:${task.label}:${task.room}`;
+}
+
+function taskDisplayLabel(task) {
+	if (!task) return 'Unbekannter Task';
+	return task.room ? `${task.label} (${task.room})` : task.label;
+}
+
+function normalizeIsbn(value) {
+	return value.replace(/[-\s]/g, '').toUpperCase();
+}
+
+function isValidIsbn(value) {
+	const isbn = normalizeIsbn(value);
+	if (/^\d{9}[\dX]$/.test(isbn)) {
+		let sum = 0;
+		for (let i = 0; i < 10; i += 1) sum += (isbn[i] === 'X' ? 10 : Number(isbn[i])) * (10 - i);
+		return sum % 11 === 0;
+	}
+
+	if (/^\d{13}$/.test(isbn)) {
+		const sum = isbn.slice(0, 12).split('').reduce((total, digit, index) =>
+			total + Number(digit) * (index % 2 ? 3 : 1), 0);
+		return (10 - (sum % 10)) % 10 === Number(isbn[12]);
+	}
+	return false;
+}
+
+async function lookupBookMetadata(isbn) {
+	const response = await fetch(
+		`https://openlibrary.org/api/books?bibkeys=ISBN:${encodeURIComponent(isbn)}&format=json&jscmd=data`,
+		{ headers: { Accept: 'application/json', 'User-Agent': 'among-us-real-life/1.0' } }
+	);
+	if (!response.ok) return null;
+	const data = await response.json();
+	const book = data[`ISBN:${isbn}`];
+	if (!book) return null;
+	return {
+		title: typeof book.title === 'string' ? book.title : '',
+		authors: Array.isArray(book.authors)
+			? book.authors.map(author => author.name).filter(Boolean).join(', ')
+			: ''
+	};
+}
+
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
 const adminCode = process.env.ADMIN_CODE;
@@ -98,11 +183,11 @@ const DEFAULT_TASK_COLLECTION_ID = 'default';
 let taskCollections = [{
 	id: DEFAULT_TASK_COLLECTION_ID,
 	name: 'Standard',
-	tasks: TASKS.slice()
+	tasks: TASKS.map(normalizeTask)
 }];
 let selectedTaskCollectionId = DEFAULT_TASK_COLLECTION_ID;
 let gameConfig = {
-	tasks: TASKS,
+	tasks: TASKS.map(normalizeTask),
 	numImpostors: N_IMPOSTORS,
 	numTasksPerPlayer: DEFAULT_TASKS_PER_PLAYER,
 	emergencyCooldownMinutes: 1,
@@ -113,6 +198,9 @@ let gameConfig = {
 	sabotageDurationSeconds: 60,
 	// New: shared sabotage charges for all impostors
 	sabotageCharges: 2,
+	// 'button' keeps the existing system; 'qr' requires two configured QR values.
+	sabotageMode: 'button',
+	sabotageQrCodes: [],
 	// Delay between automatic completion of tasks belonging to dead crewmates
 	deadTaskCompletionIntervalSeconds: 90
 };
@@ -124,6 +212,8 @@ let killCooldownEndMsBySocketId = {};
 let socketIdToAuth = {};
 let authToPlayer = Object.create(null); // auth -> { role: string, tasks: { [taskId]: label } }
 let taskActivityByAuth = Object.create(null);
+let taskActionProgressByAuth = Object.create(null);
+let bookIsbns = Object.create(null);
 let gameLog = [];
 let impostorAuths = new Set();
 let killCooldownEndMsByAuth = Object.create(null);
@@ -169,6 +259,21 @@ loadPersistentState();
 app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
 app.get('/api/player-auth-config', (_req, res) => {
 	res.json({ required: playerJoinCodeRequired });
+});
+app.get('/api/admin/books.csv', (req, res) => {
+	const authorization = req.get('authorization');
+	if (!isValidAdminSessionToken(authorization)) {
+		return res.status(401).json({ error: 'unauthorized' });
+	}
+	const rows = [['isbn', 'player', 'taskId', 'recordedAt']];
+	for (const entries of Object.values(bookIsbns)) {
+		for (const entry of entries) {
+			rows.push([entry.isbn, entry.title || '', entry.authors || '', entry.playerName, entry.taskId, new Date(entry.recordedAt).toISOString()]);
+		}
+	}
+	rows[0] = ['isbn', 'title', 'authors', 'player', 'taskId', 'recordedAt'];
+	const csv = rows.map(row => row.map(value => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\r\n');
+	res.type('text/csv').set('Content-Disposition', 'attachment; filename="among-us-books.csv"').send(`${csv}\r\n`);
 });
 app.use('/api', createCollectionMapRouter({
 	express,
@@ -429,7 +534,7 @@ io.on('connection', socket => {
 		taskCollections = collections.map(collection => ({
 			id: collection.id,
 			name: collection.name.trim(),
-			tasks: collection.tasks.map(task => task.trim())
+			tasks: collection.tasks.map(normalizeTask)
 		}));
 		const retainedIds = new Set(taskCollections.map(collection => collection.id));
 		collectionMaps = Object.assign(Object.create(null), collectionMaps);
@@ -437,7 +542,7 @@ io.on('connection', socket => {
 			if (!retainedIds.has(collectionId)) delete collectionMaps[collectionId];
 		}
 		selectedTaskCollectionId = selectedCollection.id;
-		gameConfig.tasks = selectedCollection.tasks.slice();
+		gameConfig.tasks = selectedCollection.tasks.map(normalizeTask);
 		if (!persistState()) {
 			taskCollections = previousCollections;
 			selectedTaskCollectionId = previousSelectedCollectionId;
@@ -574,9 +679,20 @@ io.on('connection', socket => {
 			if (typeof payload.sabotageCharges === 'number' && payload.sabotageCharges >= 0) {
 				gameConfig.sabotageCharges = payload.sabotageCharges;
 			}
+			if (payload.sabotageMode === 'button' || payload.sabotageMode === 'qr') {
+				gameConfig.sabotageMode = payload.sabotageMode;
+			}
+			if (Array.isArray(payload.sabotageQrCodes) &&
+				payload.sabotageQrCodes.length <= 20 &&
+				payload.sabotageQrCodes.every(code => typeof code === 'string' && code.trim().length <= 300)) {
+				gameConfig.sabotageQrCodes = payload.sabotageQrCodes.map(code => code.trim()).filter(Boolean);
+			}
 			if (typeof payload.deadTaskCompletionIntervalSeconds === 'number' &&
 				payload.deadTaskCompletionIntervalSeconds > 0) {
 				gameConfig.deadTaskCompletionIntervalSeconds = payload.deadTaskCompletionIntervalSeconds;
+			}
+			if (gameConfig.sabotageMode === 'qr' && gameConfig.sabotageQrCodes.length < 2) {
+				return socket.emit('start-error', { reason: 'invalid-sabotage-qr-config' });
 			}
 		}
 		selectedTaskCollectionId = selectedCollection?.id || requestedCollectionId;
@@ -611,6 +727,8 @@ io.on('connection', socket => {
 		console.log('[start-game] impostors (auths)', Array.from(impostorAuths));
 		console.log('[start-game] unique players (auths)', uniqueAuths);
 		authToPlayer = Object.create(null);
+		taskActionProgressByAuth = Object.create(null);
+		bookIsbns = Object.create(null);
 		killCooldownEndMsByAuth = Object.create(null);
 		killCooldownEndMsBySocketId = {};
         //Reset dead players
@@ -650,12 +768,12 @@ io.on('connection', socket => {
 		}
 
 		// Assign tasks with per-player uniqueness and global per-task cap
-		const tasksPool = Array.isArray(gameConfig.tasks) ? gameConfig.tasks.slice() : [];
+		const tasksPool = Array.isArray(gameConfig.tasks) ? gameConfig.tasks.map(normalizeTask) : [];
 		const maxPerTask = Math.max(1, Number(gameConfig.maxPlayersPerTask || 2));
 		const desiredTaskCount = Math.max(1, Number(gameConfig.numTasksPerPlayer || DEFAULT_TASKS_PER_PLAYER));
 		const tasksPerPlayer = Math.min(desiredTaskCount, Math.max(1, tasksPool.length || 1));
 		const assignedCountByTask = Object.create(null);
-		for (const t of tasksPool) assignedCountByTask[t] = 0;
+		for (const t of tasksPool) assignedCountByTask[taskKey(t)] = 0;
 
 		// Track each player's assigned labels to enforce uniqueness
 		const playerTaskLabels = Object.create(null);
@@ -672,26 +790,26 @@ io.on('connection', socket => {
 		for (let i = 0; i < tasksPerPlayer; i++) {
 			for (const a of uniqueAuths) {
 				const labelSet = playerTaskLabels[a];
-				const eligible = tasksPool.filter(taskLabel => {
-					return !labelSet.has(taskLabel) && (assignedCountByTask[taskLabel] || 0) < maxPerTask;
+				const eligible = tasksPool.filter(task => {
+					return !labelSet.has(taskKey(task)) && (assignedCountByTask[taskKey(task)] || 0) < maxPerTask;
 				});
 				let candidates = eligible;
 				if (candidates.length === 0) {
-					candidates = tasksPool.filter(taskLabel => !labelSet.has(taskLabel));
+					candidates = tasksPool.filter(task => !labelSet.has(taskKey(task)));
 				}
 				if (candidates.length === 0) {
 					continue;
 				}
-				const minCount = Math.min(...candidates.map(taskLabel => assignedCountByTask[taskLabel] || 0));
-				const taskLabel = _.shuffle(candidates.filter(taskLabel => (assignedCountByTask[taskLabel] || 0) === minCount))[0];
-				if (!taskLabel) continue;
+				const minCount = Math.min(...candidates.map(task => assignedCountByTask[taskKey(task)] || 0));
+				const task = _.shuffle(candidates.filter(candidate => (assignedCountByTask[taskKey(candidate)] || 0) === minCount))[0];
+				if (!task) continue;
 
-				labelSet.add(taskLabel);
-				assignedCountByTask[taskLabel] = (assignedCountByTask[taskLabel] || 0) + 1;
+				labelSet.add(taskKey(task));
+				assignedCountByTask[taskKey(task)] = (assignedCountByTask[taskKey(task)] || 0) + 1;
 
 				const taskId = crypto.randomUUID();
-				playerTasks[a][taskId] = taskLabel;
-				console.log('[assign-task]', { auth: a, taskId, taskLabel });
+				playerTasks[a][taskId] = task;
+				console.log('[assign-task]', { auth: a, taskId, task: taskDisplayLabel(task) });
 				if (!impostorAuths.has(a)) {
 					taskProgress[taskId] = false;
 				}
@@ -895,15 +1013,34 @@ io.on('connection', socket => {
 		}, durationMs);
 	});
 
-	socket.on('defuse-sabotage', () => {
+	socket.on('defuse-sabotage', code => {
 		if (!socket.data.playerId || !isGameActive || !isSabotageActive) return;
 		const auth = socketIdToAuth[socket.id];
 		if (!auth || deadAuths.has(auth)) return;
-		if (sabotageDefuserAuths.has(auth)) return;
-		sabotageDefuserAuths.add(auth);
-		io.emit('sabotage-progress', { completed: sabotageDefuserAuths.size, required: 2 });
+		if (gameConfig.sabotageMode === 'qr') {
+			const normalizedCode = typeof code === 'string' ? code.trim() : '';
+			if (!normalizedCode || !gameConfig.sabotageQrCodes.includes(normalizedCode)) return;
+			if (sabotageDefuserAuths.has(`${auth}:${normalizedCode}`)) return;
+			sabotageDefuserAuths.add(`${auth}:${normalizedCode}`);
+			const scannedCodes = new Set(Array.from(sabotageDefuserAuths)
+				.filter(value => value.startsWith(`${auth}:`))
+				.map(value => value.slice(auth.length + 1)));
+			if (scannedCodes.size < 1) return;
+			// QR mode requires two different codes, scanned by any living players.
+			const distinctCodes = new Set(Array.from(sabotageDefuserAuths)
+				.map(value => value.includes(':') ? value.slice(value.indexOf(':') + 1) : value));
+			io.emit('sabotage-progress', { completed: distinctCodes.size, required: 2 });
+			if (distinctCodes.size < 2) {
+				persistState();
+				return;
+			}
+		} else {
+			if (sabotageDefuserAuths.has(auth)) return;
+			sabotageDefuserAuths.add(auth);
+			io.emit('sabotage-progress', { completed: sabotageDefuserAuths.size, required: 2 });
+			if (sabotageDefuserAuths.size < 2) return;
+		}
 		persistState();
-		if (sabotageDefuserAuths.size < 2) return;
 
 		isSabotageActive = false;
 		sabotageEndMs = 0;
@@ -929,7 +1066,8 @@ io.on('connection', socket => {
 	socket.on('task-complete', taskId => {
 		if (!socket.data.playerId || isMeeting || !isGameActive) return;
 		const auth = socketIdToAuth[socket.id];
-		if (!auth || deadAuths.has(auth) || impostorAuths.has(auth) || !authToPlayer[auth]?.tasks?.[taskId]) return;
+		const task = authToPlayer[auth]?.tasks?.[taskId];
+		if (!auth || deadAuths.has(auth) || impostorAuths.has(auth) || !task || task.type !== 'manual') return;
 		const isNewlyCompleted = taskProgress[taskId] === false;
 		if (typeof taskProgress[taskId] === 'boolean') {
 			taskProgress[taskId] = true;
@@ -942,6 +1080,165 @@ io.on('connection', socket => {
 		if (isNewlyCompleted && progress.total > 0 && progress.completed === progress.total) {
 			finishGame('crewmates');
 		}
+		persistState();
+		broadcastGamemasterUpdate();
+	});
+
+	socket.on('task-action', (taskId, value, acknowledge) => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		if (!socket.data.playerId || isMeeting || !isGameActive) return reply({ ok: false, reason: 'unavailable' });
+		const auth = socketIdToAuth[socket.id];
+		const task = authToPlayer[auth]?.tasks?.[taskId];
+		if (!auth || deadAuths.has(auth) || impostorAuths.has(auth) || !task || !['qr', 'isbn'].includes(task.type)) {
+			return reply({ ok: false, reason: 'invalid-task' });
+		}
+		const input = typeof value === 'string' ? value.trim() : '';
+		if (!input) return reply({ ok: false, reason: 'empty-value' });
+		if (!taskActionProgressByAuth[auth]) taskActionProgressByAuth[auth] = Object.create(null);
+		const progress = taskActionProgressByAuth[auth][taskId] || { values: [], approved: [] };
+		if (!Array.isArray(progress.values)) progress.values = [];
+		if (!Array.isArray(progress.approved)) progress.approved = [];
+		if (task.type === 'qr') {
+			if (!Array.isArray(task.qrCodes) || !task.qrCodes.includes(input)) {
+				return reply({ ok: false, reason: 'invalid-qr' });
+			}
+			if (progress.values.includes(input)) return reply({ ok: false, reason: 'duplicate' });
+			progress.values.push(input);
+		} else {
+			const isbn = normalizeIsbn(input);
+			if (!isValidIsbn(isbn)) return reply({ ok: false, reason: 'invalid-isbn' });
+			if (progress.values.includes(isbn)) return reply({ ok: false, reason: 'duplicate' });
+			progress.values.push(isbn);
+			if (!bookIsbns[taskId]) bookIsbns[taskId] = [];
+			bookIsbns[taskId].push({
+				isbn,
+				title: '',
+				authors: '',
+				playerId: auth,
+				approved: false,
+				playerName: playerDirectory[auth]?.name || auth,
+				taskId,
+				recordedAt: Date.now()
+			});
+		}
+		taskActionProgressByAuth[auth][taskId] = progress;
+		const required = task.type === 'isbn' ? Math.max(1, Number(task.isbnCount || 1)) : Math.max(1, task.qrCodes.length);
+		const completedCount = task.type === 'isbn' ? progress.approved.length : progress.values.length;
+		const isNewlyCompleted = taskProgress[taskId] === false && completedCount >= required;
+		if (completedCount >= required) {
+			taskProgress[taskId] = true;
+			recordTaskActivity(auth, taskId, true);
+		}
+		socket.emit('task-action-progress', {
+			taskId,
+			completed: completedCount,
+			submitted: progress.values.length,
+			required
+		});
+		if (task.type === 'isbn') {
+			const entry = bookIsbns[taskId][bookIsbns[taskId].length - 1];
+			const submittedIsbn = progress.values[progress.values.length - 1];
+			socket.emit('book-submitted', {
+				taskId,
+				isbn: submittedIsbn,
+				title: entry.title,
+				authors: entry.authors,
+				approved: false
+			});
+			void lookupBookMetadata(submittedIsbn).then(metadata => {
+				if (!metadata) return;
+				entry.title = metadata.title;
+				entry.authors = metadata.authors;
+				persistState();
+				socket.emit('book-metadata', { taskId, isbn: submittedIsbn, ...metadata });
+			}).catch(error => {
+				console.warn('[books] Metadata lookup failed:', error.message);
+			});
+		}
+		socket.emit('tasks-completed', getCompletionMapForAuth(auth));
+		reply({
+			ok: true,
+			completed: completedCount,
+			submitted: progress.values.length,
+			required,
+			isbn: task.type === 'isbn' ? progress.values[progress.values.length - 1] : undefined
+		});
+		emitTaskProgress();
+		if (isNewlyCompleted && getGlobalProgress().total > 0 && getGlobalProgress().completed === getGlobalProgress().total) {
+			finishGame('crewmates');
+		}
+		persistState();
+		broadcastGamemasterUpdate();
+	});
+
+	socket.on('task-action-approve', (taskId, value, acknowledge) => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		const auth = socketIdToAuth[socket.id];
+		const task = authToPlayer[auth]?.tasks?.[taskId];
+		const isbn = typeof value === 'string' ? normalizeIsbn(value) : '';
+		const progress = taskActionProgressByAuth[auth]?.[taskId];
+		if (!auth || deadAuths.has(auth) || impostorAuths.has(auth) || task?.type !== 'isbn' ||
+			!progress?.values?.includes(isbn)) {
+			return reply({ ok: false, reason: 'not-found' });
+		}
+		if (!Array.isArray(progress.approved)) progress.approved = [];
+		if (progress.approved.includes(isbn)) return reply({ ok: false, reason: 'duplicate' });
+		progress.approved.push(isbn);
+		const entry = (bookIsbns[taskId] || []).find(item =>
+			item.isbn === isbn && (item.playerId === auth || item.playerName === (playerDirectory[auth]?.name || auth))
+		);
+		if (entry) entry.approved = true;
+		const required = Math.max(1, Number(task.isbnCount || 1));
+		const completed = progress.approved.length;
+		if (completed >= required && taskProgress[taskId] === false) {
+			taskProgress[taskId] = true;
+			recordTaskActivity(auth, taskId, true);
+		}
+		socket.emit('book-approved', { taskId, isbn });
+		socket.emit('task-action-progress', {
+			taskId,
+			completed,
+			submitted: progress.values.length,
+			required
+		});
+		socket.emit('tasks-completed', getCompletionMapForAuth(auth));
+		reply({ ok: true, completed, required });
+		emitTaskProgress();
+		if (completed >= required && getGlobalProgress().total > 0 &&
+			getGlobalProgress().completed === getGlobalProgress().total) {
+			finishGame('crewmates');
+		}
+		persistState();
+		broadcastGamemasterUpdate();
+	});
+
+	socket.on('task-action-remove', (taskId, value, acknowledge) => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		const auth = socketIdToAuth[socket.id];
+		const task = authToPlayer[auth]?.tasks?.[taskId];
+		const isbn = typeof value === 'string' ? normalizeIsbn(value) : '';
+		const progress = taskActionProgressByAuth[auth]?.[taskId];
+		if (!auth || deadAuths.has(auth) || impostorAuths.has(auth) || task?.type !== 'isbn' ||
+			!progress?.values?.includes(isbn)) {
+			return reply({ ok: false, reason: 'not-found' });
+		}
+		progress.values = progress.values.filter(item => item !== isbn);
+		progress.approved = Array.isArray(progress.approved)
+			? progress.approved.filter(item => item !== isbn)
+			: [];
+		bookIsbns[taskId] = (bookIsbns[taskId] || []).filter(entry =>
+			!(entry.isbn === isbn && (entry.playerId === auth || entry.playerName === (playerDirectory[auth]?.name || auth)))
+		);
+		if (progress.approved.length < Number(task.isbnCount || 1)) taskProgress[taskId] = false;
+		socket.emit('task-action-progress', {
+			taskId,
+			completed: progress.approved.length,
+			submitted: progress.values.length,
+			required: Math.max(1, Number(task.isbnCount || 1))
+		});
+		socket.emit('tasks-completed', getCompletionMapForAuth(auth));
+		reply({ ok: true });
+		emitTaskProgress();
 		persistState();
 		broadcastGamemasterUpdate();
 	});
@@ -1114,6 +1411,7 @@ function getStateSnapshot(includeAdminData) {
 		mapUrl: getCollectionMapUrl(selectedTaskCollectionId),
 		config: includeAdminData ? gameConfig : undefined,
 		sabotageEndMs,
+		sabotageMode: gameConfig.sabotageMode,
 		sabotageChargesRemaining,
 		sabotageDefusedCount: sabotageDefuserAuths.size,
 		gameWinner,
@@ -1138,15 +1436,15 @@ function getGamemasterSnapshot() {
 			.filter(item => item.completed && Number.isFinite(item.completedAt))
 			.sort((a, b) => b.completedAt - a.completedAt)[0];
 		const latestTask = activity && info.tasks?.[activity.taskId];
-		const roomMatch = latestTask && /^(.*)\s+\(([^()]*)\)$/.exec(latestTask);
+		const roomMatch = latestTask && latestTask.room;
 		return {
 			id: player.id,
 			name: player.name,
 			connected,
 			alive: !deadAuths.has(player.id),
 			role: isGameActive && info.role ? info.role : '',
-			currentRoom: roomMatch?.[2] || (latestTask ? 'Raum nicht angegeben' : 'Noch kein Task'),
-			lastTask: roomMatch?.[1] || latestTask || null,
+			currentRoom: roomMatch || (latestTask ? 'Raum nicht angegeben' : 'Noch kein Task'),
+			lastTask: latestTask ? taskDisplayLabel(latestTask) : null,
 			lastTaskAt: activity?.completedAt || null
 		};
 	});
@@ -1162,7 +1460,7 @@ function recordTaskActivity(auth, taskId, completed) {
 		taskId
 	};
 	if (completed) {
-		const label = authToPlayer[auth]?.tasks?.[taskId] || 'Unbekannter Task';
+		const label = taskDisplayLabel(authToPlayer[auth]?.tasks?.[taskId]);
 		appendGameLog('task-complete', `${playerDirectory[auth]?.name || auth} erledigt: ${label}`, { playerId: auth, taskId, impostor: impostorAuths.has(auth) });
 	}
 }
@@ -1187,6 +1485,33 @@ function sendPlayerSnapshot(socket, playerId) {
 	if (info?.role) socket.emit('role', info.role);
 	if (info?.tasks) socket.emit('tasks', info.tasks);
 	socket.emit('tasks-completed', getCompletionMapForAuth(playerId));
+	for (const [taskId, progress] of Object.entries(taskActionProgressByAuth[playerId] || {})) {
+		const task = authToPlayer[playerId]?.tasks?.[taskId];
+		const required = task?.type === 'isbn'
+			? Math.max(1, Number(task.isbnCount || 1))
+			: Math.max(1, task?.qrCodes?.length || 1);
+		socket.emit('task-action-progress', {
+			taskId,
+			completed: task?.type === 'isbn'
+				? (Array.isArray(progress.approved) ? progress.approved.length : 0)
+				: (Array.isArray(progress.values) ? progress.values.length : 0),
+			submitted: Array.isArray(progress.values) ? progress.values.length : 0,
+			required
+		});
+	}
+	for (const entries of Object.values(bookIsbns)) {
+		for (const entry of entries) {
+			if (entry.playerId === playerId || (!entry.playerId && entry.playerName === playerDirectory[playerId]?.name)) {
+				socket.emit('book-submitted', {
+					taskId: entry.taskId,
+					isbn: entry.isbn,
+					title: entry.title || '',
+					authors: entry.authors || '',
+					approved: entry.approved === true
+				});
+			}
+		}
+	}
 	socket.emit('sabotage-usage', { used: sabotageUsedAuths.has(playerId) });
 	if (isSabotageActive && sabotageEndMs > Date.now()) {
 		socket.emit('sabotage-started', { endMs: sabotageEndMs });
@@ -1229,6 +1554,8 @@ function persistState() {
 		sabotageChargesRemaining,
 		gameWinner,
 		taskActivityByAuth,
+		taskActionProgressByAuth,
+		bookIsbns,
 		gameLog,
 		playerJoinCode
 	};
@@ -1258,7 +1585,7 @@ function loadPersistentState() {
 			!Array.isArray(saved.sabotageUsedAuths) ||
 			(saved.sabotageDefuserAuths !== undefined && !Array.isArray(saved.sabotageDefuserAuths)) ||
 			!Array.isArray(saved.gameConfig.tasks) ||
-			!saved.gameConfig.tasks.every(task => typeof task === 'string') ||
+			!saved.gameConfig.tasks.every(task => typeof task === 'string' || isValidTask(task)) ||
 			!Object.entries(saved.playerDirectory).every(([id, player]) =>
 				isRecord(player) && player.id === id && typeof player.name === 'string' && player.name.trim()
 			) ||
@@ -1326,13 +1653,17 @@ function loadPersistentState() {
 
 		if (saved.gameConfig && typeof saved.gameConfig === 'object') {
 			gameConfig = { ...gameConfig, ...saved.gameConfig };
-			if (!Array.isArray(gameConfig.tasks)) gameConfig.tasks = TASKS;
+			gameConfig.tasks = Array.isArray(gameConfig.tasks) ? gameConfig.tasks.map(normalizeTask) : TASKS.map(normalizeTask);
+			gameConfig.sabotageMode = gameConfig.sabotageMode === 'qr' ? 'qr' : 'button';
+			gameConfig.sabotageQrCodes = Array.isArray(gameConfig.sabotageQrCodes)
+				? gameConfig.sabotageQrCodes.filter(code => typeof code === 'string').map(code => code.trim()).filter(Boolean)
+				: [];
 		}
 		if (Array.isArray(saved.taskCollections)) {
 			taskCollections = saved.taskCollections.map(collection => ({
 				id: collection.id,
 				name: collection.name.trim(),
-				tasks: collection.tasks.map(task => task.trim())
+				tasks: collection.tasks.map(normalizeTask)
 			}));
 		} else {
 			taskCollections = [{
@@ -1360,10 +1691,17 @@ function loadPersistentState() {
 			}
 		}
 		authToPlayer = Object.assign(Object.create(null), saved.authToPlayer);
+		for (const player of Object.values(authToPlayer)) {
+			player.tasks = Object.fromEntries(
+				Object.entries(player.tasks || {}).map(([taskId, task]) => [taskId, normalizeTask(task)])
+			);
+		}
 		if (saved.taskProgress && typeof saved.taskProgress === 'object') {
 			taskProgress = Object.assign(Object.create(null), saved.taskProgress);
 		}
 		taskActivityByAuth = Object.assign(Object.create(null), saved.taskActivityByAuth || {});
+		taskActionProgressByAuth = Object.assign(Object.create(null), saved.taskActionProgressByAuth || {});
+		bookIsbns = Object.assign(Object.create(null), saved.bookIsbns || {});
 		gameLog = Array.isArray(saved.gameLog) ? saved.gameLog.slice(-200) : [];
 		isMeeting = saved.isMeeting === true;
 		isGameActive = saved.isGameActive === true;
@@ -1479,9 +1817,10 @@ function isValidTaskCollections(collections) {
 			collection.name.trim().length > 64 ||
 			!Array.isArray(collection.tasks) ||
 			collection.tasks.length > 500 ||
-			!collection.tasks.every(task => typeof task === 'string' && task.trim().length > 0 && task.trim().length <= 200)) {
+			!collection.tasks.every(isValidTask)) {
 			return false;
 		}
+
 		const normalizedName = collection.name.trim().toLocaleLowerCase();
 		if (ids.has(collection.id) || names.has(normalizedName)) return false;
 		ids.add(collection.id);

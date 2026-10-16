@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { Alert, Backdrop, Box, Button, Card, CardContent, Checkbox, FormControlLabel, IconButton, LinearProgress, List, ListItem, ListItemText, Snackbar, Stack, TextField, Tooltip, Typography, Dialog, DialogContent } from '@mui/material';
+import { Alert, Backdrop, Box, Button, Card, CardContent, Checkbox, FormControlLabel, IconButton, LinearProgress, List, ListItem, ListItemText, Snackbar, Stack, TextField, Tooltip, Typography, Dialog, DialogContent, Chip } from '@mui/material';
 import MapIcon from '@mui/icons-material/Map';
 
 function WinnerSnackbar({ winner, onClose }) {
@@ -24,6 +24,13 @@ function decodeVapidKey(key) {
 export default function Player() {
   const [tasks, setTasks] = useState({});
   const [completed, setCompleted] = useState({});
+  const [actionProgress, setActionProgress] = useState({});
+  const [actionInputs, setActionInputs] = useState({});
+  const [actionErrors, setActionErrors] = useState({});
+  const [submittedBooks, setSubmittedBooks] = useState({});
+  const [scannerTaskId, setScannerTaskId] = useState('');
+  const scannerVideoRef = useRef(null);
+  const scannerStreamRef = useRef(null);
   const [progress, setProgress] = useState(0);
   const [role, setRole] = useState('');
   const [authId, setAuthId] = useState('');
@@ -52,6 +59,7 @@ export default function Player() {
   const [pushSubscriptionSaved, setPushSubscriptionSaved] = useState(false);
   const audioRef = useRef(null);
   const socketRef = useRef(null);
+  const submittingActionsRef = useRef(new Set());
   const authIdRef = useRef(authId);
   authIdRef.current = authId;
   const pushReadyRef = useRef(false);
@@ -71,6 +79,8 @@ export default function Player() {
   const isSabotageActive = sabotageRemainingMs > 0;
   const [sabotageDefusedCount, setSabotageDefusedCount] = useState(0);
   const [sabotageChargesRemaining, setSabotageChargesRemaining] = useState(0);
+  const [sabotageMode, setSabotageMode] = useState('button');
+  const [sabotageCodeInput, setSabotageCodeInput] = useState('');
   // Stopwatch state
   const [stopwatchRunning, setStopwatchRunning] = useState(false);
   const [stopwatchMs, setStopwatchMs] = useState(0);
@@ -176,6 +186,56 @@ export default function Player() {
     socket.on('tasks', (t) => { setTasks(t || {}); });
     socket.on('progress', (p) => { setProgress(p || 0); });
     socket.on('tasks-completed', (m) => { setCompleted(m || {}); });
+    socket.on('task-action-progress', ({ taskId, completed: count, submitted, required }) => {
+      if (!taskId) return;
+      setActionProgress((previous) => ({
+        ...previous,
+        [taskId]: { completed: count || 0, submitted: submitted || count || 0, required: required || 1 }
+      }));
+    });
+    socket.on('book-submitted', ({ taskId, isbn, title, authors, approved }) => {
+      if (!taskId || !isbn) return;
+      setSubmittedBooks((previous) => {
+        const current = previous[taskId] || [];
+        const existing = current.find((book) => book.isbn === isbn);
+        if (existing) {
+          let merged = false;
+          const books = current.filter((book) => {
+            if (book.isbn !== isbn) return true;
+            if (merged) return false;
+            merged = true;
+            return true;
+          }).map((book) => book.isbn === isbn
+            ? {
+              ...book,
+              title: title || book.title,
+              authors: authors || book.authors,
+              approved: approved === true
+            }
+            : book);
+          return { ...previous, [taskId]: books };
+        }
+        return {
+          ...previous,
+          [taskId]: [...current, { isbn, title: title || '', authors: authors || '', approved: approved === true }]
+        };
+      });
+    });
+    socket.on('book-approved', ({ taskId, isbn }) => {
+      setSubmittedBooks((previous) => ({
+        ...previous,
+        [taskId]: (previous[taskId] || []).map((book) => book.isbn === isbn ? { ...book, approved: true } : book)
+      }));
+    });
+    socket.on('book-metadata', ({ taskId, isbn, title, authors }) => {
+      if (!taskId || !isbn) return;
+      setSubmittedBooks((previous) => ({
+        ...previous,
+        [taskId]: (previous[taskId] || []).map((book) => book.isbn === isbn
+          ? { ...book, title: title || '', authors: authors || '' }
+          : book)
+      }));
+    });
     socket.on('role', (r) => { setRole(r || ''); setIsImpostor(r === 'Impostor'); });
     socket.on('play-meeting', async () => {
       await playerActionsRef.current.playSound('/sounds/meeting.mp3');
@@ -214,6 +274,7 @@ export default function Player() {
       setMapUrl(typeof s?.mapUrl === 'string' ? s.mapUrl : '');
       if (typeof s?.sabotageChargesRemaining === 'number') setSabotageChargesRemaining(s.sabotageChargesRemaining);
       if (typeof s?.sabotageDefusedCount === 'number') setSabotageDefusedCount(s.sabotageDefusedCount);
+      if (s?.sabotageMode === 'button' || s?.sabotageMode === 'qr') setSabotageMode(s.sabotageMode);
     });
     socket.on('player-dead', () => setIsDead(true));
     socket.on('sabotage-started', ({ endMs }) => {
@@ -361,12 +422,130 @@ export default function Player() {
         } catch (error) {
           console.warn('Could not persist impostor task progress.', error);
         }
+
         return next;
       });
       return;
     }
     socket.emit(checked ? 'task-complete' : 'task-incomplete', taskId);
   }
+
+  function submitTaskAction(taskId) {
+    const value = (actionInputs[taskId] || '').trim();
+    const submissionKey = `${taskId}:${value}`;
+    if (!value || disableTasks || submittingActionsRef.current.has(submissionKey)) return;
+    submittingActionsRef.current.add(submissionKey);
+    const socket = socketRef.current;
+    if (!socket) {
+      submittingActionsRef.current.delete(submissionKey);
+      return;
+    }
+    socket.timeout(5000).emit('task-action', taskId, value, (timeoutError, response) => {
+      submittingActionsRef.current.delete(submissionKey);
+      if (timeoutError || !response?.ok) {
+        const messages = {
+          'invalid-isbn': 'That is not a valid ISBN-10 or ISBN-13.',
+          'invalid-qr': 'This QR value does not belong to the task.',
+          duplicate: 'This value was already submitted.',
+          unavailable: 'The task is not available right now.',
+          'invalid-task': 'This task is no longer assigned to you.',
+          'empty-value': 'Enter or scan a value first.'
+        };
+        setActionErrors((previous) => ({
+          ...previous,
+          [taskId]: timeoutError
+            ? 'The server did not respond. Check your connection and try again.'
+            : messages[response?.reason] || `The value could not be submitted${response?.reason ? ` (${response.reason})` : ''}.`
+        }));
+        return;
+      }
+      setActionErrors((previous) => ({ ...previous, [taskId]: '' }));
+      setActionInputs((previous) => ({ ...previous, [taskId]: '' }));
+    });
+  }
+
+  function removeSubmittedIsbn(taskId, isbn) {
+    socketRef.current?.timeout(5000).emit('task-action-remove', taskId, isbn, (timeoutError, response) => {
+      if (timeoutError || !response?.ok) {
+        setActionErrors((previous) => ({ ...previous, [taskId]: 'The ISBN could not be removed.' }));
+        return;
+      }
+
+      setSubmittedBooks((previous) => ({
+        ...previous,
+        [taskId]: (previous[taskId] || []).filter((book) => book.isbn !== isbn)
+      }));
+    });
+  }
+
+  function approveSubmittedIsbn(taskId, isbn) {
+    socketRef.current?.timeout(5000).emit('task-action-approve', taskId, isbn, (timeoutError, response) => {
+      if (timeoutError || !response?.ok) {
+        setActionErrors((previous) => ({ ...previous, [taskId]: 'The ISBN could not be approved.' }));
+      }
+    });
+  }
+
+  function stopQrScanner() {
+    scannerStreamRef.current?.getTracks().forEach((track) => track.stop());
+    scannerStreamRef.current = null;
+    setScannerTaskId('');
+  }
+
+  async function startQrScanner(taskId) {
+    if (!('BarcodeDetector' in window) || !navigator.mediaDevices?.getUserMedia) {
+      setPushMessage('QR scanning is not supported here. Use a QR scanner keyboard or enter the value manually.');
+      return;
+    }
+    setScannerTaskId(taskId);
+  }
+
+  useEffect(() => {
+    if (!scannerTaskId) return undefined;
+    let cancelled = false;
+    const scan = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        scannerStreamRef.current = stream;
+        if (scannerVideoRef.current) {
+          scannerVideoRef.current.srcObject = stream;
+          await scannerVideoRef.current.play();
+        }
+        const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+        const tick = async () => {
+          if (cancelled || !scannerVideoRef.current) return;
+          try {
+            const codes = await detector.detect(scannerVideoRef.current);
+            const value = codes[0]?.rawValue;
+            if (value) {
+              setActionInputs((previous) => ({ ...previous, [scannerTaskId]: value }));
+              stopQrScanner();
+              return;
+            }
+          } catch (error) {
+            console.warn('QR detection failed.', error);
+            stopQrScanner();
+            return;
+          }
+          window.requestAnimationFrame(tick);
+        };
+        tick();
+      } catch (error) {
+        console.warn('Could not start QR scanner.', error);
+        stopQrScanner();
+      }
+    };
+    scan();
+    return () => {
+      cancelled = true;
+      scannerStreamRef.current?.getTracks().forEach((track) => track.stop());
+      scannerStreamRef.current = null;
+    };
+  }, [scannerTaskId]);
 
   async function waitMs(ms) {
     await new Promise((r) => setTimeout(r, ms));
@@ -690,7 +869,7 @@ export default function Player() {
             <Typography variant="body2">
               Players who have defused: {sabotageDefusedCount} / 2
             </Typography>
-            {!isDead && (
+            {!isDead && sabotageMode === 'button' && (
               <Button
                 variant="contained"
                 color="warning"
@@ -701,6 +880,27 @@ export default function Player() {
               >
                 Defuse sabotage
               </Button>
+            )}
+            {!isDead && sabotageMode === 'qr' && (
+              <Stack spacing={1} sx={{ width: '100%', maxWidth: 300 }}>
+                <TextField
+                  size="small"
+                  label="QR value (scan or enter)"
+                  value={sabotageCodeInput}
+                  onChange={(event) => setSabotageCodeInput(event.target.value)}
+                />
+                <Button
+                  variant="contained"
+                  color="warning"
+                  disabled={!sabotageCodeInput.trim()}
+                  onClick={() => {
+                    socketRef.current?.emit('defuse-sabotage', sabotageCodeInput.trim());
+                    setSabotageCodeInput('');
+                  }}
+                >
+                  Submit scanned QR
+                </Button>
+              </Stack>
             )}
           </Stack>
         </Alert>
@@ -753,16 +953,100 @@ export default function Player() {
         <CardContent>
           <Typography variant="h6" gutterBottom>Tasks</Typography>
           <List>
-            {Object.entries(tasks).map(([taskId, label]) => (
+            {Object.entries(tasks).map(([taskId, task]) => {
+              const item = typeof task === 'string' ? { label: task, type: 'manual' } : task;
+              const action = actionProgress[taskId] || {
+                completed: 0,
+                submitted: 0,
+                required: item.type === 'isbn' ? item.isbnCount || 1 : item.qrCodes?.length || 1
+              };
+              return (
               <ListItem key={taskId} disableGutters>
-                <FormControlLabel control={<Checkbox disabled={disableTasks} checked={!!completed[taskId]} onChange={(e) => toggleTask(taskId, e.target.checked)} />} label={<ListItemText primary={label} />} />
+                <Stack spacing={1} sx={{ width: '100%' }}>
+                  <FormControlLabel
+                    control={item.type === 'manual'
+                      ? <Checkbox disabled={disableTasks} checked={!!completed[taskId]} onChange={(e) => toggleTask(taskId, e.target.checked)} />
+                      : <Checkbox disabled checked={!!completed[taskId]} />}
+                    label={<ListItemText primary={item.room ? `${item.label} (${item.room})` : item.label} />}
+                  />
+                  {item.type !== 'manual' && (
+                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ pl: 4 }}>
+                      <TextField
+                        size="small"
+                        fullWidth
+                        label={item.type === 'isbn' ? 'ISBN (scan or enter)' : 'QR value (scan or enter)'}
+                        value={actionInputs[taskId] || ''}
+                        disabled={disableTasks || !!completed[taskId]}
+                        onChange={(event) => setActionInputs((previous) => ({ ...previous, [taskId]: event.target.value }))}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault();
+                            submitTaskAction(taskId);
+                          }
+                        }}
+                      />
+                      <Button
+                        variant="outlined"
+                        onClick={() => item.type === 'qr' && !(actionInputs[taskId] || '').trim()
+                          ? startQrScanner(taskId)
+                          : submitTaskAction(taskId)}
+                        disabled={disableTasks || !!completed[taskId]}
+                      >
+                        {item.type === 'isbn' ? 'Add ISBN' : (actionInputs[taskId] || '').trim() ? 'Submit QR' : 'Scan QR'}
+                      </Button>
+                    </Stack>
+                  )}
+                  {actionErrors[taskId] && <Alert severity="error" sx={{ ml: 4 }}>{actionErrors[taskId]}</Alert>}
+                  {item.type === 'isbn' && submittedBooks[taskId]?.length > 0 && (
+                    <Stack spacing={0.5} sx={{ ml: 4 }}>
+                      <Typography variant="caption" color="text.secondary">Submitted books</Typography>
+                      {submittedBooks[taskId].map((book) => (
+                        <Stack key={book.isbn} direction="row" spacing={1} alignItems="center">
+                          <Box sx={{ minWidth: 0, flex: 1 }}>
+                            <Typography variant="body2">{book.isbn}</Typography>
+                            <Typography variant="caption" color="text.secondary">
+                              {book.title || 'Looking up title…'}{book.authors ? ` — ${book.authors}` : ''} · {book.approved ? 'Approved' : 'Needs approval'}
+                            </Typography>
+                          </Box>
+                          {!book.approved && (
+                            <Button size="small" color="success" onClick={() => approveSubmittedIsbn(taskId, book.isbn)}>
+                              Approve
+                            </Button>
+                          )}
+                          <Button size="small" color="error" onClick={() => removeSubmittedIsbn(taskId, book.isbn)}>
+                            Remove
+                          </Button>
+                        </Stack>
+                      ))}
+                    </Stack>
+                  )}
+                  {item.type !== 'manual' && (
+                    <Chip
+                      size="small"
+                      sx={{ alignSelf: 'flex-start', ml: 4 }}
+                      label={item.type === 'isbn'
+                        ? `${action.completed} approved / ${action.required} (${action.submitted} submitted)`
+                        : `${action.completed} / ${action.required}`}
+                      color={completed[taskId] ? 'success' : 'default'}
+                    />
+                  )}
+                </Stack>
               </ListItem>
-            ))}
+              );
+            })}
           </List>
         </CardContent>
       </Card>
 
       <audio ref={audioRef} preload="auto" playsInline />
+
+      <Dialog open={!!scannerTaskId} onClose={stopQrScanner}>
+        <DialogContent>
+          <Typography gutterBottom>Point the camera at the task QR code.</Typography>
+          <Box ref={scannerVideoRef} component="video" muted playsInline sx={{ width: 'min(80vw, 420px)', display: 'block' }} />
+          <Button fullWidth sx={{ mt: 1 }} onClick={stopQrScanner}>Cancel</Button>
+        </DialogContent>
+      </Dialog>
 
       <Backdrop open={meeting} sx={{ color: '#fff', zIndex: (t) => t.zIndex.drawer + 1 }}>
         <Typography variant="h4" align="center">COME BACK FOR A MEETING</Typography>

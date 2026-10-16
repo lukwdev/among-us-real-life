@@ -6,6 +6,7 @@ I hacked together this small little web app for facilitating a game of Among Us 
 
 -   Assign impostors/crewmates
 -   Assign tasks
+-   Configure physical, QR-action, and optional ISBN collection tasks
 -   Checking off tasks updates a global progress bar in real-time
 -   Automatically announce crew task victories and impostor parity victories
 
@@ -30,6 +31,10 @@ Players join by entering a name. Names are case-insensitive and must be unique w
 Crewmates win when every assigned crew task is complete. Tasks belonging to a dead crewmate are automatically completed one at a time after the configured **Dead Player Task Interval**, which defaults to 90 seconds and can be changed in the admin game settings. Impostors win when the number of living impostors equals or exceeds the living crewmates; because eliminations are confirmed by players in this real-life game, a crewmate should use **Mark me as eliminated** after being eliminated. Either faction victory plays the win sound and shows a popup; opted-in push subscribers also receive a notification when their browser is in the background. The admin can then end the round before starting another.
 
 Impostors can activate sabotage using an available charge. The configured **Sabotage Duration** (60 seconds by default) starts a visible countdown and notification for all players. Any two different living players can press **Defuse sabotage**; if the timer expires first, the impostors win immediately. A successful defuse also sends a notification. The duration and shared sabotage charges can be changed in the admin game settings.
+
+Tasks are structured objects but old string-based task collections are migrated automatically. A **Physical / self-confirmed** task is completed by checking it off after doing the real-world action. A **QR action** task accepts one or more configured QR values; players can scan with a supported phone camera or enter the value from a scanner, and the task completes only after all required values are accepted. An **ISBN collection** task validates ISBN-10/ISBN-13 values, stores every submitted book on the backend, and completes after its configured count. The admin dashboard can export the collected books as `among-us-books.csv` for resale workflows.
+
+Sabotage can remain in the current two-player button mode or be switched to **Two QR codes**. In QR mode, configure two secret QR values in the game settings; living players must submit both codes before the sabotage timer expires. Task collections are location-specific, so ISBN tasks and QR sabotage can be omitted from locations where they are not useful.
 
 ### 2. Deploy with Docker Compose
 

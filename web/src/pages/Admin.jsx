@@ -1,18 +1,43 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { Accordion, AccordionDetails, AccordionSummary, Alert, Box, Button, Card, CardContent, Chip, Divider, FormControl, IconButton, InputLabel, LinearProgress, MenuItem, Paper, Select, Snackbar, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Tooltip, Typography } from '@mui/material';
+import QRCode from 'qrcode';
+import { Accordion, AccordionDetails, AccordionSummary, Alert, Box, Button, Card, CardContent, Chip, Dialog, DialogActions, DialogContent, DialogTitle, Divider, FormControl, IconButton, InputLabel, LinearProgress, MenuItem, Paper, Select, Snackbar, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Tooltip, Typography } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 
 function splitTaskLabel(label) {
-    const match = /^(.*)\s+\(([^()]*)\)$/.exec(label);
-    return match ? { task: match[1], room: match[2] } : { task: label, room: '' };
+    if (label && typeof label === 'object') {
+        return {
+            task: label.label || '',
+            room: label.room || '',
+            type: label.type || 'manual',
+            qrCodes: Array.isArray(label.qrCodes) ? label.qrCodes : [],
+            isbnCount: label.isbnCount || 1,
+            id: label.id
+        };
+    }
+    const match = /^(.*)\s+\(([^()]*)\)$/.exec(label || '');
+    return match ? { task: match[1], room: match[2], type: 'manual', qrCodes: [], isbnCount: 1 } : { task: label || '', room: '', type: 'manual', qrCodes: [], isbnCount: 1 };
 }
 
-function joinTaskLabel(task, room) {
-    return room ? `${task} (${room})` : task;
+function joinTaskLabel(task, room, type = 'manual', options = {}) {
+    return {
+        id: options.id || crypto.randomUUID(),
+        label: task.trim(),
+        room: room.trim(),
+        type,
+        ...(type === 'qr' ? { qrCodes: options.qrCodes || [] } : {}),
+        ...(type === 'isbn' ? { isbnCount: Number(options.isbnCount) || 1 } : {})
+    };
+}
+
+function downloadQrCode(dataUrl, filename) {
+    const link = document.createElement('a');
+    link.href = dataUrl;
+    link.download = filename;
+    link.click();
 }
 
 function TaskCollectionEditor({
@@ -26,6 +51,12 @@ function TaskCollectionEditor({
     setTaskName,
     taskLocation,
     setTaskLocation,
+    taskType,
+    setTaskType,
+    taskCodes,
+    setTaskCodes,
+    isbnCount,
+    setIsbnCount,
     collectionsDirty,
     isConnected,
     mapUploadInProgress,
@@ -35,7 +66,8 @@ function TaskCollectionEditor({
     saveTaskCollections,
     uploadCollectionMap,
     removeCollectionMap,
-    updateSelectedCollectionTasks
+    updateSelectedCollectionTasks,
+    openQrGenerator
 }) {
     const selectedCollection = taskCollections.find((collection) => collection.id === selectedTaskCollectionId);
 
@@ -179,14 +211,31 @@ function TaskCollectionEditor({
                                     const name = taskName.trim();
                                     const room = taskLocation.trim();
                                     if (!name) return;
-                                    updateSelectedCollectionTasks((current) => [...current, joinTaskLabel(name, room)]);
+                                    updateSelectedCollectionTasks((current) => [...current, joinTaskLabel(name, room, taskType, {
+                                        qrCodes: taskCodes.split(',').map((code) => code.trim()).filter(Boolean),
+                                        isbnCount
+                                    })]);
                                     setTaskName('');
                                     setTaskLocation('');
+                                    setTaskCodes('');
+                                    setIsbnCount('1');
                                 }}
                                 sx={{ minWidth: { sm: 100 } }}
                             >
                                 Add task
                             </Button>
+                        </Stack>
+                        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                            <FormControl fullWidth>
+                                <InputLabel id="task-type-label">Type</InputLabel>
+                                <Select labelId="task-type-label" label="Type" value={taskType} onChange={(event) => setTaskType(event.target.value)}>
+                                    <MenuItem value="manual">Physical / self-confirmed</MenuItem>
+                                    <MenuItem value="qr">QR action</MenuItem>
+                                    <MenuItem value="isbn">ISBN collection</MenuItem>
+                                </Select>
+                            </FormControl>
+                            {taskType === 'qr' && <TextField label="Expected QR values (comma separated)" value={taskCodes} onChange={(event) => setTaskCodes(event.target.value)} fullWidth />}
+                            {taskType === 'isbn' && <TextField label="ISBN count" value={isbnCount} onChange={(event) => setIsbnCount(event.target.value)} inputMode="numeric" fullWidth />}
                         </Stack>
                     </Stack>
 
@@ -196,20 +245,21 @@ function TaskCollectionEditor({
                                 <TableRow>
                                     <TableCell sx={{ minWidth: 200, width: '60%' }}>Task</TableCell>
                                     <TableCell sx={{ minWidth: 160, width: '35%' }}>Room</TableCell>
+                                    <TableCell sx={{ minWidth: 150 }}>Type</TableCell>
                                     <TableCell align="right" sx={{ width: 56 }}>Actions</TableCell>
                                 </TableRow>
                             </TableHead>
                             <TableBody>
                                 {tasks.length === 0 ? (
                                     <TableRow>
-                                        <TableCell colSpan={3} align="center">
+                                        <TableCell colSpan={4} align="center">
                                             <Typography variant="body2" color="text.secondary">No tasks yet. Add one above.</Typography>
                                         </TableCell>
                                     </TableRow>
                                 ) : tasks.map((label, idx) => {
-                                    const { task, room } = splitTaskLabel(label);
+                                    const { task, room, type, qrCodes, isbnCount: taskIsbnCount, id } = splitTaskLabel(label);
                                     return (
-                                        <TableRow key={`${selectedTaskCollectionId}-${idx}`}>
+                                        <TableRow key={`${selectedTaskCollectionId}-${id || idx}`}>
                                             <TableCell>
                                                 <TextField
                                                     aria-label={`Task ${idx + 1}`}
@@ -217,7 +267,7 @@ function TaskCollectionEditor({
                                                     onChange={(event) => {
                                                         const nextTask = event.target.value;
                                                         updateSelectedCollectionTasks((current) => current.map((entry, entryIndex) =>
-                                                            entryIndex === idx ? joinTaskLabel(nextTask, room) : entry
+                                                            entryIndex === idx ? joinTaskLabel(nextTask, room, type, { id, qrCodes, isbnCount: taskIsbnCount }) : entry
                                                         ));
                                                     }}
                                                     inputProps={{ maxLength: 200 }}
@@ -232,13 +282,23 @@ function TaskCollectionEditor({
                                                     onChange={(event) => {
                                                         const nextRoom = event.target.value;
                                                         updateSelectedCollectionTasks((current) => current.map((entry, entryIndex) =>
-                                                            entryIndex === idx ? joinTaskLabel(task, nextRoom) : entry
+                                                            entryIndex === idx ? joinTaskLabel(task, nextRoom, type, { id, qrCodes, isbnCount: taskIsbnCount }) : entry
                                                         ));
                                                     }}
                                                     inputProps={{ maxLength: 64 }}
                                                     variant="standard"
                                                     fullWidth
                                                 />
+                                            </TableCell>
+                                            <TableCell>
+                                                <Stack direction="row" spacing={0.5} alignItems="center">
+                                                    <Chip size="small" label={type === 'isbn' ? `ISBN ×${taskIsbnCount}` : type === 'qr' ? `QR ×${qrCodes.length}` : 'Physical'} />
+                                                    {type === 'qr' && (
+                                                        <Button size="small" onClick={() => openQrGenerator(qrCodes, task)}>
+                                                            QR codes
+                                                        </Button>
+                                                    )}
+                                                </Stack>
                                             </TableCell>
                                             <TableCell align="right">
                                                 <IconButton
@@ -310,6 +370,9 @@ export default function Admin() {
     const [numTasksPerPlayer, setNumTasksPerPlayer] = useState('5');
     const [taskName, setTaskName] = useState('');
     const [taskLocation, setTaskLocation] = useState('');
+    const [taskType, setTaskType] = useState('manual');
+    const [taskCodes, setTaskCodes] = useState('');
+    const [isbnCount, setIsbnCount] = useState('5');
     const [tasks, setTasks] = useState([]);
     const [taskCollections, setTaskCollections] = useState([]);
     const [collectionsDirty, setCollectionsDirty] = useState(false);
@@ -321,6 +384,9 @@ export default function Admin() {
     const [maxPlayersPerTask, setMaxPlayersPerTask] = useState('2');
     const [sabotageSeconds, setSabotageSeconds] = useState('60');
     const [sabotageCharges, setSabotageCharges] = useState('2');
+    const [sabotageMode, setSabotageMode] = useState('button');
+    const [sabotageQrCodes, setSabotageQrCodes] = useState('');
+    const [qrDialog, setQrDialog] = useState({ open: false, title: '', values: [], images: [] });
     const [deadTaskCompletionIntervalSeconds, setDeadTaskCompletionIntervalSeconds] = useState('90');
     const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
     const [connectedPlayers, setConnectedPlayers] = useState([]);
@@ -432,6 +498,8 @@ export default function Admin() {
                 if (typeof s.config.maxPlayersPerTask === 'number') setMaxPlayersPerTask(String(s.config.maxPlayersPerTask));
                 if (typeof s.config.sabotageDurationSeconds === 'number') setSabotageSeconds(String(s.config.sabotageDurationSeconds));
                 if (typeof s.config.sabotageCharges === 'number') setSabotageCharges(String(s.config.sabotageCharges));
+                if (s.config.sabotageMode === 'button' || s.config.sabotageMode === 'qr') setSabotageMode(s.config.sabotageMode);
+                if (Array.isArray(s.config.sabotageQrCodes)) setSabotageQrCodes(s.config.sabotageQrCodes.join(', '));
                 if (typeof s.config.deadTaskCompletionIntervalSeconds === 'number') {
                     setDeadTaskCompletionIntervalSeconds(String(s.config.deadTaskCompletionIntervalSeconds));
                 }
@@ -480,7 +548,8 @@ export default function Admin() {
             const messages = {
                 'no-players': 'At least one player must be connected before starting.',
                 'empty-task-collection': 'Add at least one task to this collection before starting.',
-                'invalid-task-collection': 'Select a valid task collection before starting.'
+                'invalid-task-collection': 'Select a valid task collection before starting.',
+                'invalid-sabotage-qr-config': 'QR sabotage needs at least two QR values.'
             };
             setStartError(messages[reason] || 'The game could not be started. Check the game status and try again.');
         });
@@ -515,6 +584,8 @@ export default function Admin() {
             maxPlayersPerTask: Number.isFinite(parseInt(maxPlayersPerTask, 10)) ? parseInt(maxPlayersPerTask, 10) : undefined,
             sabotageDurationSeconds: Number.isFinite(parseInt(sabotageSeconds, 10)) ? parseInt(sabotageSeconds, 10) : undefined,
             sabotageCharges: Number.isFinite(parseInt(sabotageCharges, 10)) ? parseInt(sabotageCharges, 10) : undefined,
+            sabotageMode,
+            sabotageQrCodes: sabotageQrCodes.split(',').map((code) => code.trim()).filter(Boolean),
             deadTaskCompletionIntervalSeconds: Number.isFinite(parseInt(deadTaskCompletionIntervalSeconds, 10))
                 ? parseInt(deadTaskCompletionIntervalSeconds, 10)
                 : undefined
@@ -587,7 +658,7 @@ export default function Admin() {
             fetch(`/api/admin/collections/${encodeURIComponent(selected.id)}/map`, {
                 method: 'POST',
                 headers: {
-                    Authorization: `Bearer ${token}`,
+                    Authorization: 'Bearer ' + token,
                     'Content-Type': file.type
                 },
                 body: file
@@ -619,7 +690,7 @@ export default function Admin() {
         try {
             const response = await fetch(`/api/admin/collections/${encodeURIComponent(selectedTaskCollectionId)}/map`, {
                 method: 'DELETE',
-                headers: { Authorization: `Bearer ${token}` }
+                headers: { Authorization: 'Bearer ' + token }
             });
             const result = await response.json().catch(() => ({}));
             if (!response.ok || !result.ok) {
@@ -688,6 +759,16 @@ export default function Admin() {
         setCollectionError('');
     }
 
+    async function openQrGenerator(values, title) {
+        const uniqueValues = [...new Set(values.filter((value) => typeof value === 'string' && value.trim()).map((value) => value.trim()))];
+        const images = await Promise.all(uniqueValues.map((value) => QRCode.toDataURL(value, {
+            errorCorrectionLevel: 'M',
+            margin: 2,
+            width: 360
+        })));
+        setQrDialog({ open: true, title, values: uniqueValues, images });
+    }
+
     function selectTaskCollection(collectionId) {
         const selected = taskCollections.find((collection) => collection.id === collectionId);
         if (!selected) return;
@@ -725,8 +806,26 @@ export default function Admin() {
                 setPlayerManagementMessage(messages[response?.reason] || 'Could not remove the player. Check the connection and try again.');
                 return;
             }
+
             setPlayerManagementMessage(`${player.name} was removed.`);
         });
+    }
+
+    async function exportBooks() {
+        const token = adminSessionTokenRef.current;
+        if (!token) return;
+        const response = await fetch('/api/admin/books.csv', { headers: { Authorization: 'Bearer ' + token } });
+        if (!response.ok) {
+            setPlayerManagementMessage('Could not export the ISBN list. Your admin session may have expired.');
+            return;
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'among-us-books.csv';
+        link.click();
+        URL.revokeObjectURL(url);
     }
 
     function login() {
@@ -929,6 +1028,12 @@ export default function Admin() {
                         setTaskName={setTaskName}
                         taskLocation={taskLocation}
                         setTaskLocation={setTaskLocation}
+                        taskType={taskType}
+                        setTaskType={setTaskType}
+                        taskCodes={taskCodes}
+                        setTaskCodes={setTaskCodes}
+                        isbnCount={isbnCount}
+                        setIsbnCount={setIsbnCount}
                         collectionsDirty={collectionsDirty}
                         isConnected={isConnected}
                         mapUploadInProgress={mapUploadInProgress}
@@ -939,6 +1044,7 @@ export default function Admin() {
                         uploadCollectionMap={uploadCollectionMap}
                         removeCollectionMap={removeCollectionMap}
                         updateSelectedCollectionTasks={updateSelectedCollectionTasks}
+                        openQrGenerator={openQrGenerator}
                     />
                 )}
 
@@ -1054,6 +1160,30 @@ export default function Admin() {
                                         <TextField label="Kill Cooldown (seconds)" value={killCooldownSeconds} onChange={(e) => setKillCooldownSeconds(e.target.value)} inputMode="decimal" fullWidth />
                                         <TextField label="Sabotage Duration (seconds)" value={sabotageSeconds} onChange={(e) => setSabotageSeconds(e.target.value)} inputMode="numeric" fullWidth />
                                         <TextField label="Sabotage Charges (shared)" value={sabotageCharges} onChange={(e) => setSabotageCharges(e.target.value)} inputMode="numeric" fullWidth />
+                                        <FormControl fullWidth>
+                                            <InputLabel id="sabotage-mode-label">Sabotage mode</InputLabel>
+                                            <Select labelId="sabotage-mode-label" label="Sabotage mode" value={sabotageMode} onChange={(e) => setSabotageMode(e.target.value)}>
+                                                <MenuItem value="button">Current: two players press</MenuItem>
+                                                <MenuItem value="qr">Two QR codes</MenuItem>
+                                            </Select>
+                                        </FormControl>
+                                        {sabotageMode === 'qr' && (
+                                            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ gridColumn: '1 / -1' }}>
+                                                <TextField
+                                                    label="Sabotage QR values (two, comma separated)"
+                                                    value={sabotageQrCodes}
+                                                    onChange={(e) => setSabotageQrCodes(e.target.value)}
+                                                    helperText="Each code must be scanned once; values are not shown to players."
+                                                    fullWidth
+                                                />
+                                                <Button
+                                                    variant="outlined"
+                                                    onClick={() => openQrGenerator(sabotageQrCodes.split(',').map((code) => code.trim()), 'Sabotage QR codes')}
+                                                >
+                                                    Generate QR codes
+                                                </Button>
+                                            </Stack>
+                                        )}
                                         <TextField label="Max Players per Task" value={maxPlayersPerTask} onChange={(e) => setMaxPlayersPerTask(e.target.value)} inputMode="numeric" fullWidth />
                                         <TextField
                                             label="Dead Player Task Interval (seconds)"
@@ -1067,6 +1197,12 @@ export default function Admin() {
                                     </Box>
                                     <Button variant="contained" color="primary" size="large" id="start-game" onClick={startGameWithConfig} disabled={!isConnected || !selectedTaskCollectionId || !tasks.length}>
                                         Start Game · {taskCollections.find((collection) => collection.id === selectedTaskCollectionId)?.name || 'Select a collection'}
+                                    </Button>
+                                    <Button
+                                        variant="outlined"
+                                        onClick={exportBooks}
+                                    >
+                                        Export ISBNs
                                     </Button>
                                 </>
                             )}
@@ -1103,6 +1239,37 @@ export default function Admin() {
                     {gameWinner === 'crewmates' ? 'Crewmates' : 'Impostors'} win!
                 </Alert>
             </Snackbar>
+            <Dialog
+                open={qrDialog.open}
+                onClose={() => setQrDialog((current) => ({ ...current, open: false }))}
+                maxWidth="md"
+                fullWidth
+            >
+                <DialogTitle>{qrDialog.title}</DialogTitle>
+                <DialogContent>
+                    {qrDialog.values.length === 0 ? (
+                        <Alert severity="warning">Enter at least one QR value first.</Alert>
+                    ) : (
+                        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} justifyContent="center" flexWrap="wrap">
+                            {qrDialog.images.map((image, index) => (
+                                <Paper key={`${qrDialog.values[index]}-${index}`} variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}>
+                                    <Box component="img" src={image} alt={`QR code for ${qrDialog.values[index]}`} sx={{ width: 260, maxWidth: '100%' }} />
+                                    <Typography variant="body2" sx={{ wordBreak: 'break-all', maxWidth: 260 }}>
+                                        {qrDialog.values[index]}
+                                    </Typography>
+                                    <Button size="small" onClick={() => downloadQrCode(image, `qr-code-${index + 1}.png`)}>
+                                        Download PNG
+                                    </Button>
+                                </Paper>
+                            ))}
+                        </Stack>
+                    )}
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => window.print()} disabled={!qrDialog.images.length}>Print</Button>
+                    <Button onClick={() => setQrDialog((current) => ({ ...current, open: false }))}>Close</Button>
+                </DialogActions>
+            </Dialog>
         </>
     );
 }
