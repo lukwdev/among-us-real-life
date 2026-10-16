@@ -12,7 +12,8 @@ import CampaignIcon from '@mui/icons-material/Campaign';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import HowToVoteIcon from '@mui/icons-material/HowToVote';
 import WifiOffIcon from '@mui/icons-material/WifiOff';
-import jsQR from 'jsqr';
+import VolumeUpIcon from '@mui/icons-material/VolumeUp';
+import VolumeOffIcon from '@mui/icons-material/VolumeOff';
 
 function WinnerSnackbar({ winner, onClose }) {
   if (!winner) return null;
@@ -23,6 +24,37 @@ function WinnerSnackbar({ winner, onClose }) {
         {winnerName} win!
       </Alert>
     </Snackbar>
+  );
+}
+
+function OfflineBanner({ isConnected }) {
+  if (isConnected) return null;
+  return (
+    <Box
+      sx={{
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        zIndex: (theme) => theme.zIndex.snackbar + 10,
+        boxShadow: 6
+      }}
+    >
+      <Alert
+        severity="error"
+        variant="filled"
+        icon={<WifiOffIcon />}
+        sx={{
+          borderRadius: 0,
+          justifyContent: 'center',
+          alignItems: 'center',
+          fontWeight: 600,
+          py: 0.75
+        }}
+      >
+        Connection lost. Reconnecting…
+      </Alert>
+    </Box>
   );
 }
 
@@ -396,11 +428,25 @@ export default function Player() {
   const [pushPublicKey, setPushPublicKey] = useState('');
   const [pushMessage, setPushMessage] = useState('');
   const [pushSubscriptionSaved, setPushSubscriptionSaved] = useState(false);
-  const audioRef = useRef(null);
+  const audioInstanceRef = useRef(null);
+  const sabotageAudioRef = useRef(null);
+  if (typeof window !== 'undefined' && 'Audio' in window) {
+    if (!audioInstanceRef.current) {
+      audioInstanceRef.current = new Audio();
+      audioInstanceRef.current.preload = 'auto';
+    }
+    if (!sabotageAudioRef.current) {
+      sabotageAudioRef.current = new Audio('/sounds/sabotage.mp3');
+      sabotageAudioRef.current.loop = true;
+      sabotageAudioRef.current.preload = 'auto';
+    }
+  }
   const socketRef = useRef(null);
   const submittingActionsRef = useRef(new Set());
   const authIdRef = useRef(authId);
   authIdRef.current = authId;
+  const roleRef = useRef(role);
+  roleRef.current = role;
   const pushReadyRef = useRef(false);
   pushReadyRef.current = pushEnabled && pushSubscriptionSaved;
   const playerActionsRef = useRef({});
@@ -688,8 +734,9 @@ export default function Player() {
     socket.on('players-updated', (list) => {
       if (Array.isArray(list)) setPlayersList(list);
     });
-    socket.on('game-started', () => {
+    socket.on('game-started', async () => {
       playerActionsRef.current.stopAllSounds();
+      await playerActionsRef.current.playSound('/sounds/start.mp3');
       setHasUsedSabotage(false);
       setSabotageEndMs(0);
       setSabotageRemainingMs(0);
@@ -784,7 +831,10 @@ export default function Player() {
     socket.on('game-won', async (result) => {
       if (!['crewmates', 'impostors'].includes(result?.winner)) return;
       setGameWinner(result.winner);
-      await playerActionsRef.current.playSound('/sounds/you-win.mp3');
+      const isPlayerImpostor = roleRef.current === 'Impostor';
+      const playerWon = (isPlayerImpostor && result.winner === 'impostors') ||
+        (!isPlayerImpostor && result.winner === 'crewmates');
+      await playerActionsRef.current.playSound(playerWon ? '/sounds/you-win.mp3' : '/sounds/you-lose.mp3');
       if ('Notification' in window && Notification.permission === 'granted' &&
           !pushReadyRef.current &&
           document.visibilityState === 'visible') {
@@ -855,6 +905,7 @@ export default function Player() {
 
   function loginWithName(event) {
     event.preventDefault();
+    void enableAudio();
     const name = nameInput.trim();
     if (!name) {
       setLoginError('Enter your name to join.');
@@ -1005,6 +1056,16 @@ export default function Player() {
           }
         }
 
+        let jsQRModule = null;
+        if (!detector) {
+          try {
+            const mod = await import('jsqr');
+            jsQRModule = mod.default || mod;
+          } catch (e) {
+            console.warn('Failed to dynamically load jsQR fallback:', e);
+          }
+        }
+
         const tick = async () => {
           if (cancelled || !scannerVideoRef.current) return;
           const video = scannerVideoRef.current;
@@ -1024,15 +1085,21 @@ export default function Player() {
 
             if (!detectedValue && ctx && video.videoWidth && video.videoHeight) {
               try {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                const code = jsQR(imageData.data, imageData.width, imageData.height, {
-                  inversionAttempts: 'dontInvert'
-                });
-                if (code?.data) {
-                  detectedValue = code.data;
+                if (!detector && !jsQRModule) {
+                  const mod = await import('jsqr');
+                  jsQRModule = mod.default || mod;
+                }
+                if (jsQRModule) {
+                  canvas.width = video.videoWidth;
+                  canvas.height = video.videoHeight;
+                  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                  const code = jsQRModule(imageData.data, imageData.width, imageData.height, {
+                    inversionAttempts: 'dontInvert'
+                  });
+                  if (code?.data) {
+                    detectedValue = code.data;
+                  }
                 }
               } catch (scanErr) {
                 console.debug('Frame decode failed:', scanErr);
@@ -1079,77 +1146,69 @@ export default function Player() {
     await new Promise((r) => setTimeout(r, ms));
   }
 
-  async function playSound(url) {
-    const el = audioRef.current;
+  const UNLOCK_SOUND = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+
+  async function enableAudio() {
+    const el = audioInstanceRef.current;
     if (!el) return;
-    // Ensure audio is user-unlocked on mobile before attempting playback
-    if (!audioReady) {
-      try {
-        await enableAudio();
-      } catch (error) {
-        console.warn('Audio could not be unlocked yet.', error);
-      }
-    }
-    el.src = url;
     try {
+      el.src = UNLOCK_SOUND;
       await el.play();
+      el.pause();
+      setAudioReady(true);
     } catch (error) {
-      console.warn('Audio playback was blocked by the browser.', error);
+      console.warn('Audio unlock deferred until user interaction:', error);
     }
   }
 
-  // Simple loop helper for sabotage alarm
-  const loopRef = useRef(null);
-  async function playLoop(url, endMs) {
-    stopLoop();
-    const el = audioRef.current;
-    if (!el) return;
-    if (!audioReady) {
-      try {
-        await enableAudio();
-      } catch (error) {
-        console.warn('Could not unlock audio for the sabotage alarm.', error);
+  async function playSound(url) {
+    try {
+      const sound = new Audio(url);
+      sound.volume = 1.0;
+      await sound.play();
+      return;
+    } catch {
+      const el = audioInstanceRef.current;
+      if (el) {
+        try {
+          el.pause();
+          el.currentTime = 0;
+          el.src = url;
+          el.volume = 1.0;
+          await el.play();
+        } catch (error) {
+          console.warn('Audio playback blocked by browser:', error);
+        }
       }
     }
-    const tick = async () => {
-      if (Date.now() >= (endMs || 0)) { stopLoop(); return; }
-      try {
-        el.src = url;
-        await el.play();
-      } catch (error) {
-        console.warn('Sabotage alarm playback failed.', error);
-      }
-      loopRef.current = setTimeout(tick, (el.duration && !isNaN(el.duration) ? el.duration * 1000 : 1500));
-    };
-    tick();
   }
+
+  function playLoop() {
+    const el = sabotageAudioRef.current;
+    if (!el) return;
+    try {
+      el.currentTime = 0;
+      el.volume = 1.0;
+      void el.play().catch((err) => console.warn('Sabotage alarm playback blocked:', err));
+    } catch (error) {
+      console.warn('Sabotage alarm playback failed:', error);
+    }
+  }
+
   function stopLoop() {
-    if (loopRef.current) { clearTimeout(loopRef.current); loopRef.current = null; }
-    const el = audioRef.current;
-    if (el) { el.pause(); el.currentTime = 0; }
+    const el = sabotageAudioRef.current;
+    if (el) {
+      el.pause();
+      el.currentTime = 0;
+    }
   }
 
   function stopAllSounds() {
     stopLoop();
-    const el = audioRef.current;
-    if (el) { el.pause(); el.currentTime = 0; }
-  }
-
-  async function enableAudio() {
-    const el = audioRef.current;
-    if (!el) return;
-    try {
-      // Try to unlock by playing a short muted sound on a user gesture
-      el.muted = true;
-      el.playsInline = true;
-      el.src = '/sounds/start.mp3';
-      await el.play();
+    const el = audioInstanceRef.current;
+    if (el) {
       el.pause();
       el.currentTime = 0;
-      el.muted = false;
-      setAudioReady(true);
-    } catch (error) {
-      console.warn('Audio remains locked; tap the screen to enable playback.', error);
     }
   }
 
@@ -1166,23 +1225,19 @@ export default function Player() {
     return () => clearInterval(i);
   }, []);
 
-  // Add a one-time user-gesture handler to unlock audio on mobile
+  // Unlock audio on any mobile/desktop user interaction until unlocked
   useEffect(() => {
-    function onFirstInteract() {
-      if (!audioReady) {
-        enableAudio();
-      }
-      window.removeEventListener('pointerdown', onFirstInteract);
-      window.removeEventListener('touchend', onFirstInteract);
-      window.removeEventListener('click', onFirstInteract);
-    }
-    window.addEventListener('pointerdown', onFirstInteract, { passive: true });
-    window.addEventListener('touchend', onFirstInteract, { passive: true });
-    window.addEventListener('click', onFirstInteract, { passive: true });
+    if (audioReady) return undefined;
+    const unlock = () => {
+      void enableAudio();
+    };
+    window.addEventListener('pointerdown', unlock, { passive: true });
+    window.addEventListener('touchend', unlock, { passive: true });
+    window.addEventListener('click', unlock, { passive: true });
     return () => {
-      window.removeEventListener('pointerdown', onFirstInteract);
-      window.removeEventListener('touchend', onFirstInteract);
-      window.removeEventListener('click', onFirstInteract);
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('touchend', unlock);
+      window.removeEventListener('click', unlock);
     };
   }, [audioReady]);
 
@@ -1237,9 +1292,22 @@ export default function Player() {
 
   const hasTasks = Object.keys(tasks).length > 0;
   const playerIdentity = (
-    <Typography variant="subtitle2" color="text.secondary" sx={{ alignSelf: 'flex-start', px: 0.5, lineHeight: 1.2 }}>
-      {playerName}
-    </Typography>
+    <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ width: '100%', maxWidth: 420, px: 0.5 }}>
+      <Typography variant="subtitle2" color="text.secondary" sx={{ lineHeight: 1.2 }}>
+        {playerName}
+      </Typography>
+      <Tooltip title={audioReady ? 'Game sound is active' : 'Click to enable game audio'}>
+        <Chip
+          size="small"
+          icon={audioReady ? <VolumeUpIcon /> : <VolumeOffIcon />}
+          label={audioReady ? 'Sound On' : 'Enable Sound'}
+          color={audioReady ? 'default' : 'warning'}
+          variant={audioReady ? 'outlined' : 'filled'}
+          onClick={enableAudio}
+          sx={{ cursor: 'pointer', height: 24, fontSize: '0.75rem' }}
+        />
+      </Tooltip>
+    </Stack>
   );
 
   if (!playerName || loginError) {
@@ -1247,10 +1315,24 @@ export default function Player() {
       <Stack component="form" spacing={1.5} alignItems="center" onSubmit={loginWithName} sx={{ width: '100%', py: 1 }}>
         <Card sx={{ width: '100%', maxWidth: 420 }}>
           <CardContent>
-            <Stack spacing={2}>
-              <Typography variant="h5" align="center">Join the game</Typography>
-              <Typography align="center">Enter your name so the admin can see when you are connected.</Typography>
-              {loginError && <Alert severity="error">{loginError}</Alert>}
+            <Stack spacing={2} alignItems="center">
+              <Box
+                component="img"
+                src="/app-icon.svg"
+                alt="Among Us Logo"
+                sx={{
+                  width: 84,
+                  height: 84,
+                  borderRadius: 3,
+                  boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
+                  mt: 0.5
+                }}
+              />
+              <Typography variant="h5" align="center" sx={{ fontWeight: 700 }}>Join the Game</Typography>
+              <Typography variant="body2" color="text.secondary" align="center">
+                Enter your name so the gamemaster can see when you are connected.
+              </Typography>
+              {loginError && <Alert severity="error" sx={{ width: '100%' }}>{loginError}</Alert>}
               <TextField
                 autoFocus
                 label="Your name"
@@ -1281,8 +1363,8 @@ export default function Player() {
   if (!gameActive) {
     return (
       <Stack spacing={1} alignItems="center" sx={{ width: '100%' }}>
+        <OfflineBanner isConnected={isConnected} />
         {playerIdentity}
-        {!isConnected && <Alert severity="error" icon={<WifiOffIcon />} sx={{ width: '100%', maxWidth: 420 }}>Connection lost. Reconnecting…</Alert>}
         {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
         {isConnected && pushEnabled && !pushSubscriptionSaved && (
           <Button variant="outlined" onClick={() => syncPushSubscription(socketRef.current, pushPublicKey, true)}>
@@ -1317,8 +1399,8 @@ export default function Player() {
   if (gameActive && !hasTasks) {
     return (
       <Stack spacing={1} alignItems="center" sx={{ width: '100%' }}>
+        <OfflineBanner isConnected={isConnected} />
         {playerIdentity}
-        {!isConnected && <Alert severity="error" icon={<WifiOffIcon />} sx={{ width: '100%', maxWidth: 420 }}>Connection lost. Reconnecting…</Alert>}
         {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
         {isConnected && pushEnabled && !pushSubscriptionSaved && (
           <Button variant="outlined" onClick={() => syncPushSubscription(socketRef.current, pushPublicKey, true)}>
@@ -1351,8 +1433,8 @@ export default function Player() {
 
   return (
     <Stack spacing={1} alignItems="center" sx={{ width: '100%' }}>
+      <OfflineBanner isConnected={isConnected} />
       {playerIdentity}
-      {!isConnected && <Alert severity="error" icon={<WifiOffIcon />} sx={{ width: '100%', maxWidth: 420 }}>Connection lost. Reconnecting…</Alert>}
       {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
       {isConnected && pushEnabled && !pushSubscriptionSaved && (
         <Button variant="outlined" onClick={() => syncPushSubscription(socketRef.current, pushPublicKey, true)}>
@@ -1586,8 +1668,6 @@ export default function Player() {
           </List>
         </CardContent>
       </Card>
-
-      <audio ref={audioRef} preload="auto" playsInline />
 
       <Dialog open={!!scannerTaskId} onClose={stopQrScanner}>
         <DialogContent>

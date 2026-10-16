@@ -14,6 +14,8 @@ const { createGameProgress } = require('./game-progress');
 const { hasImpostorVictory, hasCrewmateVictory } = require('./game-outcome');
 const { createJsonStore } = require('./json-store');
 const { createPushNotifier } = require('./push-notifications');
+const { calculateVotingResults } = require('./voting');
+const { distributeTasks } = require('./task-distribution');
 
 function normalizeTask(task, index = 0) {
 	if (typeof task === 'string') {
@@ -879,16 +881,6 @@ io.on('connection', socket => {
 
 		// Assign tasks with per-player uniqueness and global per-task cap
 		const tasksPool = Array.isArray(gameConfig.tasks) ? gameConfig.tasks.map(normalizeTask) : [];
-		const maxPerTask = Math.max(1, Number(gameConfig.maxPlayersPerTask || 2));
-		const desiredTaskCount = Math.max(1, Number(gameConfig.numTasksPerPlayer || DEFAULT_TASKS_PER_PLAYER));
-		const tasksPerPlayer = Math.min(desiredTaskCount, Math.max(1, tasksPool.length || 1));
-		const assignedCountByTask = Object.create(null);
-		for (const t of tasksPool) assignedCountByTask[taskKey(t)] = 0;
-
-		// Track each player's assigned labels to enforce uniqueness
-		const playerTaskLabels = Object.create(null);
-		const playerTasks = Object.create(null);
-		taskProgress = {};
 		taskActivityByAuth = Object.create(null);
 		impostorCompletedTasksByAuth = Object.create(null);
 		meetingCaller = null;
@@ -896,40 +888,20 @@ io.on('connection', socket => {
 		meetingResults = null;
 		gameLog = [];
 		appendGameLog('game-started', 'Game started', { players: uniqueAuths.length, impostors: impostorAuths.size });
-		for (const a of uniqueAuths) {
-			playerTaskLabels[a] = new Set();
-			playerTasks[a] = {};
-		}
 
-		for (let i = 0; i < tasksPerPlayer; i++) {
-			for (const a of uniqueAuths) {
-				const labelSet = playerTaskLabels[a];
-				const eligible = tasksPool.filter(task => {
-					return !labelSet.has(taskKey(task)) && (assignedCountByTask[taskKey(task)] || 0) < maxPerTask;
-				});
-				let candidates = eligible;
-				if (candidates.length === 0) {
-					candidates = tasksPool.filter(task => !labelSet.has(taskKey(task)));
-				}
-				if (candidates.length === 0) {
-					continue;
-				}
-				const minCount = Math.min(...candidates.map(task => assignedCountByTask[taskKey(task)] || 0));
-				const task = _.shuffle(candidates.filter(candidate => (assignedCountByTask[taskKey(candidate)] || 0) === minCount))[0];
-				if (!task) continue;
+		const distribution = distributeTasks({
+			playerAuths: uniqueAuths,
+			tasksPool,
+			impostorAuths,
+			numTasksPerPlayer: gameConfig.numTasksPerPlayer || DEFAULT_TASKS_PER_PLAYER,
+			maxPlayersPerTask: gameConfig.maxPlayersPerTask,
+			taskKey
+		});
 
-				labelSet.add(taskKey(task));
-				assignedCountByTask[taskKey(task)] = (assignedCountByTask[taskKey(task)] || 0) + 1;
+		const playerTasks = distribution.playerTasks;
+		taskProgress = distribution.taskProgress;
+		console.log('[assignment-summary] per-task counts', distribution.assignedCountByTask);
 
-				const taskId = crypto.randomUUID();
-				playerTasks[a][taskId] = task;
-				console.log('[assign-task]', { auth: a, taskId, task: taskDisplayLabel(task) });
-				if (!impostorAuths.has(a)) {
-					taskProgress[taskId] = false;
-				}
-			}
-		}
-		console.log('[assignment-summary] per-task counts', assignedCountByTask);
 
 		console.log('player tasks', playerTasks);
 
@@ -1525,37 +1497,19 @@ io.on('connection', socket => {
 function concludeVoting() {
 	if (!isMeeting || meetingResults) return;
 
-	const tallies = Object.create(null);
-	tallies['skip'] = 0;
 	const livingPlayers = Object.keys(authToPlayer).filter(id => !deadAuths.has(id));
-	for (const id of livingPlayers) {
-		tallies[id] = 0;
-	}
-	for (const target of Object.values(meetingVotes)) {
-		if (tallies[target] !== undefined) tallies[target] += 1;
-		else tallies[target] = 1;
-	}
+	const playerNames = Object.fromEntries(
+		Object.entries(playerDirectory).map(([id, p]) => [id, p?.name || id])
+	);
 
-	let maxVotes = 0;
-	let topCandidate = null;
-	let isTie = false;
+	meetingResults = calculateVotingResults({
+		livingPlayerIds: livingPlayers,
+		votes: meetingVotes,
+		playerNames
+	});
 
-	for (const [candidate, count] of Object.entries(tallies)) {
-		if (count > maxVotes) {
-			maxVotes = count;
-			topCandidate = candidate;
-			isTie = false;
-		} else if (count === maxVotes && maxVotes > 0) {
-			isTie = true;
-		}
-	}
-
-	let ejected = null;
-	let ejectedName = null;
-
-	if (topCandidate && topCandidate !== 'skip' && !isTie && maxVotes > 0) {
-		ejected = topCandidate;
-		ejectedName = playerDirectory[ejected]?.name || ejected;
+	if (meetingResults.ejected) {
+		const ejected = meetingResults.ejected;
 		deadAuths.add(ejected);
 
 		if (!impostorAuths.has(ejected)) {
@@ -1569,24 +1523,13 @@ function concludeVoting() {
 				s.emit('player-dead');
 			}
 		}
-	}
-
-	meetingResults = {
-		tallies,
-		votes: meetingVotes,
-		ejected,
-		ejectedName,
-		tie: isTie || topCandidate === 'skip' || maxVotes === 0
-	};
-
-	io.emit('voting-results', meetingResults);
-	io.emit('play-vote-result');
-
-	if (ejected) {
-		appendGameLog('player-ejected', `${ejectedName} was ejected.`, { playerId: ejected });
+		appendGameLog('player-ejected', `${meetingResults.ejectedName} was ejected.`, { playerId: ejected });
 	} else {
 		appendGameLog('voting-tie', 'No one was ejected (Skipped or tie).');
 	}
+
+	io.emit('voting-results', meetingResults);
+	io.emit('play-vote-result');
 
 	broadcastPlayersToAdmins();
 	broadcastGamemasterUpdate();

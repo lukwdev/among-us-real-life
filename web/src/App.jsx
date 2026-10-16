@@ -1,8 +1,10 @@
+import { lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom'
+import { AppBar, Box, CircularProgress, Container, Toolbar, Typography } from '@mui/material'
 import Player from './pages/Player.jsx'
-import Admin from './pages/Admin.jsx'
-import Gamemaster from './pages/Gamemaster.jsx'
-import { AppBar, Box, Container, Toolbar, Typography } from '@mui/material'
+
+const Admin = lazy(() => import('./pages/Admin.jsx'))
+const Gamemaster = lazy(() => import('./pages/Gamemaster.jsx'))
 
 function Header() {
   const location = useLocation();
@@ -11,8 +13,18 @@ function Header() {
 
   return (
     <AppBar position="static" color="primary">
-      <Toolbar sx={{ justifyContent: 'space-between' }}>
-        <Typography variant="h6">{isGamemaster ? 'Gamemaster' : isAdmin ? 'Admin' : 'Player'}</Typography>
+      <Toolbar sx={{ justifyContent: 'space-between', alignItems: 'center' }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+          <Box
+            component="img"
+            src="/app-icon.svg"
+            alt="Among Us Logo"
+            sx={{ width: 34, height: 34, borderRadius: 1 }}
+          />
+          <Typography variant="h6" sx={{ fontWeight: 700, letterSpacing: '0.03em' }}>
+            {isGamemaster ? 'Gamemaster' : isAdmin ? 'Admin' : 'Among Us IRL'}
+          </Typography>
+        </Box>
       </Toolbar>
     </AppBar>
   );
@@ -40,11 +52,17 @@ function AppContent() {
             textAlign: isAdmin ? 'left' : 'center'
           }}
         >
-          <Routes>
-            <Route path="/" element={<Player />} />
-            <Route path="/admin" element={<Admin />} />
-            <Route path="/gamemaster" element={<Gamemaster />} />
-          </Routes>
+          <Suspense fallback={
+            <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', py: 8 }}>
+              <CircularProgress color="primary" />
+            </Box>
+          }>
+            <Routes>
+              <Route path="/" element={<Player />} />
+              <Route path="/admin" element={<Admin />} />
+              <Route path="/gamemaster" element={<Gamemaster />} />
+            </Routes>
+          </Suspense>
         </Container>
       </Box>
     </>
