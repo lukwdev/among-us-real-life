@@ -1,0 +1,58 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: sunday
+      time: "04:00"
+      timezone: Europe/Vienna
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      npm-non-major:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: sunday
+      time: "04:00"
+      timezone: Europe/Stockholm
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      npm-non-major:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: sunday
+      time: "04:00"
+      timezone: Europe/Stockholm
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      actions-non-major:
+        update-types:
+          - minor
+          - patch
