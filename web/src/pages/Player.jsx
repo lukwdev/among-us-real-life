@@ -534,7 +534,6 @@ export default function Player() {
         if (timeoutError || !response?.ok) {
           const messages = {
             'invalid-name': 'Enter a name between 1 and 32 characters.',
-            'name-in-use': 'That name is already connected. Choose a different name.',
             'invalid-player-code': 'The player access code is incorrect.',
             'player-code-not-configured': 'The server has not configured a player access code.',
             'rate-limited': `Too many login attempts. Please wait ${response?.retryAfterSec ?? 120} seconds before trying again.`,

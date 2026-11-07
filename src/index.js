@@ -513,13 +513,6 @@ io.on('connection', socket => {
 		if (!name || name.length > 32 || /[\u0000-\u001f\u007f]/.test(name)) {
 			return reply({ ok: false, reason: 'invalid-name' });
 		}
-		const nameInUse = Array.from(io.of('/').sockets.values()).some(other =>
-			other.id !== socket.id && other.data.playerId === playerKey
-		);
-		if (nameInUse) {
-			return reply({ ok: false, reason: 'name-in-use' });
-		}
-
 		const existingPlayer = playerDirectory[playerKey];
 		if (!existingPlayer) {
 			playerDirectory[playerKey] = { id: playerKey, name, lastSeenMs: Date.now() };
