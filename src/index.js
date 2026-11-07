@@ -210,7 +210,9 @@ const DEFAULT_TASK_COLLECTION_ID = 'default';
 let taskCollections = [{
 	id: DEFAULT_TASK_COLLECTION_ID,
 	name: 'Standard',
-	tasks: TASKS.map(normalizeTask)
+	tasks: TASKS.map(normalizeTask),
+	sabotageMode: 'button',
+	sabotageQrCodes: []
 }];
 let selectedTaskCollectionId = DEFAULT_TASK_COLLECTION_ID;
 let gameConfig = {
@@ -646,7 +648,11 @@ io.on('connection', socket => {
 		taskCollections = collections.map(collection => ({
 			id: collection.id,
 			name: collection.name.trim(),
-			tasks: collection.tasks.map(normalizeTask)
+			tasks: collection.tasks.map(normalizeTask),
+			sabotageMode: collection.sabotageMode === 'qr' ? 'qr' : 'button',
+			sabotageQrCodes: Array.isArray(collection.sabotageQrCodes)
+				? collection.sabotageQrCodes.map(code => code.trim()).filter(Boolean)
+				: []
 		}));
 		const retainedIds = new Set(taskCollections.map(collection => collection.id));
 		collectionMaps = Object.assign(Object.create(null), collectionMaps);
@@ -806,6 +812,15 @@ io.on('connection', socket => {
 			if (gameConfig.sabotageMode === 'qr' && gameConfig.sabotageQrCodes.length < 2) {
 				return socket.emit('start-error', { reason: 'invalid-sabotage-qr-config' });
 			}
+		}
+		const collectionIndex = taskCollections.findIndex(collection => collection.id === selectedCollection.id);
+		if (collectionIndex >= 0) {
+			taskCollections = taskCollections.slice();
+			taskCollections[collectionIndex] = {
+				...taskCollections[collectionIndex],
+				sabotageMode: gameConfig.sabotageMode,
+				sabotageQrCodes: gameConfig.sabotageQrCodes.slice()
+			};
 		}
 		selectedTaskCollectionId = selectedCollection?.id || requestedCollectionId;
 		console.log('[start-game] config', gameConfig);
@@ -1918,13 +1933,19 @@ function loadPersistentState() {
 			taskCollections = saved.taskCollections.map(collection => ({
 				id: collection.id,
 				name: collection.name.trim(),
-				tasks: collection.tasks.map(normalizeTask)
+				tasks: collection.tasks.map(normalizeTask),
+				sabotageMode: collection.sabotageMode === 'qr' ? 'qr' : 'button',
+				sabotageQrCodes: Array.isArray(collection.sabotageQrCodes)
+					? collection.sabotageQrCodes.filter(code => typeof code === 'string').map(code => code.trim()).filter(Boolean)
+					: []
 			}));
 		} else {
 			taskCollections = [{
 				id: DEFAULT_TASK_COLLECTION_ID,
 				name: 'Standard',
-				tasks: gameConfig.tasks.slice()
+				tasks: gameConfig.tasks.slice(),
+				sabotageMode: gameConfig.sabotageMode,
+				sabotageQrCodes: gameConfig.sabotageQrCodes.slice()
 			}];
 		}
 		selectedTaskCollectionId = typeof saved.selectedTaskCollectionId === 'string' &&
@@ -2085,7 +2106,12 @@ function isValidTaskCollections(collections) {
 			collection.name.trim().length > 64 ||
 			!Array.isArray(collection.tasks) ||
 			collection.tasks.length > 500 ||
-			!collection.tasks.every(isValidTask)) {
+			!collection.tasks.every(isValidTask) ||
+			(collection.sabotageMode !== undefined && !['button', 'qr'].includes(collection.sabotageMode)) ||
+			(collection.sabotageQrCodes !== undefined &&
+				(!Array.isArray(collection.sabotageQrCodes) ||
+					collection.sabotageQrCodes.length > 20 ||
+					!collection.sabotageQrCodes.every(code => typeof code === 'string' && code.trim().length <= 300)))) {
 			return false;
 		}
 

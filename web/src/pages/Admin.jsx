@@ -512,6 +512,10 @@ export default function Admin() {
                 setSelectedTaskCollectionId(selectedId);
                 const selected = s.taskCollections.find((collection) => collection.id === selectedId);
                 setTasks(selected?.tasks || s.config?.tasks || []);
+                if (selected) {
+                    setSabotageMode(selected.sabotageMode === 'qr' ? 'qr' : 'button');
+                    setSabotageQrCodes(Array.isArray(selected.sabotageQrCodes) ? selected.sabotageQrCodes.join(', ') : '');
+                }
             } else if (Array.isArray(s?.config?.tasks)) {
                 setTasks(s.config.tasks);
             }
@@ -576,6 +580,10 @@ export default function Admin() {
 
     function startGameWithConfig() {
         setStartError('');
+        const nextQrCodes = sabotageQrCodes.split(',').map((code) => code.trim()).filter(Boolean);
+        const nextCollections = taskCollections.map((collection) => collection.id === selectedTaskCollectionId
+            ? { ...collection, sabotageMode, sabotageQrCodes: nextQrCodes }
+            : collection);
         const payload = {
             numImpostors: Number.isFinite(parseInt(numImpostors, 10)) ? parseInt(numImpostors, 10) : 0,
             numTasksPerPlayer: Number.isFinite(parseInt(numTasksPerPlayer, 10)) ? parseInt(numTasksPerPlayer, 10) : undefined,
@@ -586,18 +594,19 @@ export default function Admin() {
             sabotageDurationSeconds: Number.isFinite(parseInt(sabotageSeconds, 10)) ? parseInt(sabotageSeconds, 10) : undefined,
             sabotageCharges: Number.isFinite(parseInt(sabotageCharges, 10)) ? parseInt(sabotageCharges, 10) : undefined,
             sabotageMode,
-            sabotageQrCodes: sabotageQrCodes.split(',').map((code) => code.trim()).filter(Boolean),
+            sabotageQrCodes: nextQrCodes,
             deadTaskCompletionIntervalSeconds: Number.isFinite(parseInt(deadTaskCompletionIntervalSeconds, 10))
                 ? parseInt(deadTaskCompletionIntervalSeconds, 10)
                 : undefined
         };
+        setTaskCollections(nextCollections);
         saveTaskCollections((saved) => {
             if (!saved) return;
             socketRef.current?.emit('start-game', payload);
-        });
+        }, nextCollections);
     }
 
-    function saveTaskCollections(onSaved) {
+    function saveTaskCollections(onSaved, collectionsOverride = taskCollections) {
         setCollectionError('');
         if (!socketRef.current?.connected) {
             setCollectionError('The game server is offline. Reconnect before saving collections.');
@@ -606,7 +615,7 @@ export default function Admin() {
         }
 
         socketRef.current?.timeout(10000).emit('save-task-collections', {
-            collections: taskCollections,
+            collections: collectionsOverride,
             selectedTaskCollectionId
         }, (timeoutError, response) => {
             if (timeoutError || !response?.ok) {
@@ -724,7 +733,7 @@ export default function Admin() {
             setCollectionError('You can create up to 100 collections.');
             return;
         }
-        const collection = { id: crypto.randomUUID(), name, tasks: [] };
+        const collection = { id: crypto.randomUUID(), name, tasks: [], sabotageMode: 'button', sabotageQrCodes: [] };
         setTaskCollections((current) => [...current, collection]);
         setCollectionsDirty(true);
         setSelectedTaskCollectionId(collection.id);
@@ -775,6 +784,8 @@ export default function Admin() {
         if (!selected) return;
         setSelectedTaskCollectionId(collectionId);
         setTasks(selected.tasks);
+        setSabotageMode(selected.sabotageMode === 'qr' ? 'qr' : 'button');
+        setSabotageQrCodes(Array.isArray(selected.sabotageQrCodes) ? selected.sabotageQrCodes.join(', ') : '');
         setCollectionsDirty(true);
         setCollectionError('');
     }
