@@ -455,6 +455,7 @@ export default function Player() {
   const [gameActive, setGameActive] = useState(false);
   const [gameWinner, setGameWinner] = useState(null);
   const [isDead, setIsDead] = useState(false);
+  const [deadPlayersCanCompleteTasks, setDeadPlayersCanCompleteTasks] = useState(false);
   const [isImpostor, setIsImpostor] = useState(false);
   const [hasUsedSabotage, setHasUsedSabotage] = useState(false);
   const [killCooldownRemainingMs, setKillCooldownRemainingMs] = useState(0);
@@ -757,6 +758,7 @@ export default function Player() {
       setMeeting(!!s?.isMeeting);
       setGameActive(!!s?.isGameActive);
       setGameWinner(['crewmates', 'impostors'].includes(s?.gameWinner) ? s.gameWinner : null);
+      setDeadPlayersCanCompleteTasks(s?.deadPlayersCanCompleteTasks === true);
       setMapUrl(typeof s?.mapUrl === 'string' ? s.mapUrl : '');
       if (typeof s?.sabotageChargesRemaining === 'number') setSabotageChargesRemaining(s.sabotageChargesRemaining);
       if (typeof s?.sabotageDefusedCount === 'number') setSabotageDefusedCount(s.sabotageDefusedCount);
@@ -1208,7 +1210,7 @@ export default function Player() {
 
   // Players report by clicking the report image, not via keyboard
 
-  const disableTasks = meeting || !gameActive || isDead;
+  const disableTasks = meeting || !gameActive || (isDead && !deadPlayersCanCompleteTasks);
   useEffect(() => {
     const updateKillCooldown = () => {
       const remaining = Math.max(0, killCooldownEndMsRef.current - Date.now());
@@ -1556,7 +1558,13 @@ export default function Player() {
           </Stack>
         </Alert>
       ) : null}
-      {isDead && <Alert severity="warning">You are eliminated and can no longer complete tasks.</Alert>}
+      {isDead && (
+        <Alert severity="warning">
+          {deadPlayersCanCompleteTasks
+            ? 'You are eliminated, but you can still complete tasks.'
+            : 'You are eliminated and can no longer complete tasks.'}
+        </Alert>
+      )}
       {gameActive && role === 'Crewmate' && !isDead && (
         <Button
           variant="outlined"

@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import QRCode from 'qrcode';
-import { Accordion, AccordionDetails, AccordionSummary, Alert, Box, Button, Card, CardContent, Chip, Dialog, DialogActions, DialogContent, DialogTitle, Divider, FormControl, IconButton, InputLabel, LinearProgress, MenuItem, Paper, Select, Snackbar, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Tooltip, Typography } from '@mui/material';
+import { Accordion, AccordionDetails, AccordionSummary, Alert, Box, Button, Card, CardContent, Checkbox, Chip, Dialog, DialogActions, DialogContent, DialogTitle, Divider, FormControl, FormControlLabel, IconButton, InputLabel, LinearProgress, MenuItem, Paper, Select, Snackbar, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Tooltip, Typography } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
@@ -387,6 +387,7 @@ export default function Admin() {
     const [sabotageMode, setSabotageMode] = useState('button');
     const [sabotageQrCodes, setSabotageQrCodes] = useState('');
     const [qrDialog, setQrDialog] = useState({ open: false, title: '', values: [], images: [] });
+    const [deadPlayersCanCompleteTasks, setDeadPlayersCanCompleteTasks] = useState(false);
     const [deadTaskCompletionIntervalSeconds, setDeadTaskCompletionIntervalSeconds] = useState('90');
     const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
     const [connectedPlayers, setConnectedPlayers] = useState([]);
@@ -501,6 +502,9 @@ export default function Admin() {
                 if (typeof s.config.sabotageCharges === 'number') setSabotageCharges(String(s.config.sabotageCharges));
                 if (s.config.sabotageMode === 'button' || s.config.sabotageMode === 'qr') setSabotageMode(s.config.sabotageMode);
                 if (Array.isArray(s.config.sabotageQrCodes)) setSabotageQrCodes(s.config.sabotageQrCodes.join(', '));
+                if (typeof s.config.deadPlayersCanCompleteTasks === 'boolean') {
+                    setDeadPlayersCanCompleteTasks(s.config.deadPlayersCanCompleteTasks);
+                }
                 if (typeof s.config.deadTaskCompletionIntervalSeconds === 'number') {
                     setDeadTaskCompletionIntervalSeconds(String(s.config.deadTaskCompletionIntervalSeconds));
                 }
@@ -595,6 +599,7 @@ export default function Admin() {
             sabotageCharges: Number.isFinite(parseInt(sabotageCharges, 10)) ? parseInt(sabotageCharges, 10) : undefined,
             sabotageMode,
             sabotageQrCodes: nextQrCodes,
+            deadPlayersCanCompleteTasks,
             deadTaskCompletionIntervalSeconds: Number.isFinite(parseInt(deadTaskCompletionIntervalSeconds, 10))
                 ? parseInt(deadTaskCompletionIntervalSeconds, 10)
                 : undefined
@@ -1260,8 +1265,20 @@ export default function Admin() {
                                             onChange={(e) => setDeadTaskCompletionIntervalSeconds(e.target.value)}
                                             inputMode="numeric"
                                             inputProps={{ min: 1 }}
-                                            helperText="One unfinished task from a dead crewmate is completed after each interval."
+                                            disabled={deadPlayersCanCompleteTasks}
+                                            helperText={deadPlayersCanCompleteTasks
+                                                ? 'Disabled while dead players complete tasks manually.'
+                                                : 'One unfinished task from a dead crewmate is completed after each interval.'}
                                             fullWidth
+                                        />
+                                        <FormControlLabel
+                                            control={(
+                                                <Checkbox
+                                                    checked={deadPlayersCanCompleteTasks}
+                                                    onChange={(event) => setDeadPlayersCanCompleteTasks(event.target.checked)}
+                                                />
+                                            )}
+                                            label="Allow dead players to complete tasks manually"
                                         />
                                     </Box>
                                     <Button variant="contained" color="primary" size="large" id="start-game" onClick={startGameWithConfig} disabled={!isConnected || !selectedTaskCollectionId || !tasks.length}>
