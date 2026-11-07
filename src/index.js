@@ -5,7 +5,6 @@ const http = require('http');
 const fs = require('fs');
 const crypto = require('crypto');
 const dotenv = require('dotenv');
-const _ = require('lodash');
 const path = require('path');
 const { Server } = require('socket.io');
 const webPush = require('web-push');
@@ -206,6 +205,7 @@ const DEFAULT_TASKS_PER_PLAYER = N_TASKS;
 let taskProgress = Object.create(null);
 let isMeeting = false;
 let isGameActive = false;
+let impostorAssignmentCountsByAuth = Object.create(null);
 const DEFAULT_TASK_COLLECTION_ID = 'default';
 let taskCollections = [{
 	id: DEFAULT_TASK_COLLECTION_ID,
@@ -564,6 +564,7 @@ io.on('connection', socket => {
 			authToPlayer,
 			pushSubscriptions,
 			killCooldownEndMsByAuth,
+			impostorAssignmentCountsByAuth,
 			impostorAuths,
 			deadAuths
 		};
@@ -571,12 +572,14 @@ io.on('connection', socket => {
 		authToPlayer = Object.assign(Object.create(null), authToPlayer);
 		pushSubscriptions = Object.assign(Object.create(null), pushSubscriptions);
 		killCooldownEndMsByAuth = Object.assign(Object.create(null), killCooldownEndMsByAuth);
+		impostorAssignmentCountsByAuth = Object.assign(Object.create(null), impostorAssignmentCountsByAuth);
 		impostorAuths = new Set(impostorAuths);
 		deadAuths = new Set(deadAuths);
 		delete playerDirectory[playerId];
 		delete authToPlayer[playerId];
 		delete pushSubscriptions[playerId];
 		delete killCooldownEndMsByAuth[playerId];
+		delete impostorAssignmentCountsByAuth[playerId];
 		impostorAuths.delete(playerId);
 		deadAuths.delete(playerId);
 
@@ -585,6 +588,7 @@ io.on('connection', socket => {
 			authToPlayer = previousState.authToPlayer;
 			pushSubscriptions = previousState.pushSubscriptions;
 			killCooldownEndMsByAuth = previousState.killCooldownEndMsByAuth;
+			impostorAssignmentCountsByAuth = previousState.impostorAssignmentCountsByAuth;
 			impostorAuths = previousState.impostorAuths;
 			deadAuths = previousState.deadAuths;
 			return reply({ ok: false, reason: 'persistence-unavailable' });
@@ -658,6 +662,23 @@ io.on('connection', socket => {
 			selectedTaskCollectionId
 		});
 		broadcastAdminState();
+	});
+
+	socket.on('reset-impostor-fairness', acknowledge => {
+		const reply = typeof acknowledge === 'function' ? acknowledge : () => {};
+		if (!isAuthenticatedAdmin(socket)) {
+			return reply({ ok: false, reason: 'unauthorized' });
+		}
+		if (isGameActive) {
+			return reply({ ok: false, reason: 'game-active' });
+		}
+		const previousCounts = impostorAssignmentCountsByAuth;
+		impostorAssignmentCountsByAuth = Object.create(null);
+		if (!persistState()) {
+			impostorAssignmentCountsByAuth = previousCounts;
+			return reply({ ok: false, reason: 'persistence-unavailable' });
+		}
+		reply({ ok: true });
 	});
 
 	socket.on('get-push-config', acknowledge => {
@@ -821,16 +842,20 @@ io.on('connection', socket => {
 		}
 
 		// Assign impostors (ensure at least 1, at most number of players)
-		const impostorCount = Math.max(1, Math.min(gameConfig.numImpostors || 1, playerIds.length));
-		const impostors = _.shuffle(playerIds).slice(0, impostorCount);
-		impostorIds = new Set(impostors);
 		// Build auth mapping for players and reset persisted maps
 		const authBySocketId = Object.create(null);
 		for (const p of players) {
 			authBySocketId[p.id] = p.data.playerId || p.handshake.query.auth || p.id;
 		}
-		impostorAuths = new Set(impostors.map(id => authBySocketId[id]));
 		const uniqueAuths = Array.from(new Set(Object.values(authBySocketId)));
+		const impostorCount = Math.max(1, Math.min(gameConfig.numImpostors || 1, uniqueAuths.length));
+		const impostorAuthList = selectBalancedImpostors(uniqueAuths, impostorCount);
+		const impostors = playerIds.filter(id => impostorAuthList.includes(authBySocketId[id]));
+		impostorIds = new Set(impostors);
+		impostorAuths = new Set(impostorAuthList);
+		for (const auth of impostorAuthList) {
+			impostorAssignmentCountsByAuth[auth] = (impostorAssignmentCountsByAuth[auth] || 0) + 1;
+		}
 		console.log('[start-game] impostors (socketIds)', Array.from(impostorIds));
 		console.log('[start-game] impostors (auths)', Array.from(impostorAuths));
 		console.log('[start-game] unique players (auths)', uniqueAuths);
@@ -859,8 +884,11 @@ io.on('connection', socket => {
 		for (const id of impostors) {
 			const socket = io.of('/').sockets.get(id);
 			if (!socket || socket.handshake.query.role !== 'PLAYER') continue;
-			socket.emit('role', 'Impostor');
 			const a = authBySocketId[id] || id;
+			const fellowImpostors = impostorAuthList
+				.filter(auth => auth !== a)
+				.map(auth => playerDirectory[auth]?.name || auth);
+			socket.emit('role', { role: 'Impostor', fellowImpostors });
 			killCooldownEndMsByAuth[a] = startNow + initialKillCooldownMs;
 			killCooldownEndMsBySocketId[id] = killCooldownEndMsByAuth[a];
 			socket.emit('kill-cooldown-updated', { endMs: killCooldownEndMsBySocketId[id] });
@@ -871,7 +899,7 @@ io.on('connection', socket => {
 			if (impostors.includes(id)) continue;
 			const socket = io.of('/').sockets.get(id);
 			if (!socket || socket.handshake.query.role !== 'PLAYER') continue;
-			socket.emit('role', 'Crewmate');
+			socket.emit('role', { role: 'Crewmate', fellowImpostors: [] });
 			console.log('[start-game] role-assigned', { socketId: id, auth: authBySocketId[id] || id, role: 'Crewmate' });
 		}
 
@@ -1573,6 +1601,27 @@ function generatePlayerJoinCode() {
 	return code;
 }
 
+function selectBalancedImpostors(playerIds, impostorCount) {
+	const selected = [];
+	const counts = Object.fromEntries(playerIds.map(playerId => [
+		playerId,
+		Number.isFinite(impostorAssignmentCountsByAuth[playerId])
+			? impostorAssignmentCountsByAuth[playerId]
+			: 0
+	]));
+
+	while (selected.length < impostorCount && selected.length < playerIds.length) {
+		const remaining = playerIds.filter(playerId => !selected.includes(playerId));
+		const minimumCount = Math.min(...remaining.map(playerId => counts[playerId]));
+		const candidates = remaining.filter(playerId => counts[playerId] === minimumCount);
+		const selectedPlayer = candidates[crypto.randomInt(candidates.length)];
+		selected.push(selectedPlayer);
+		counts[selectedPlayer] += 1;
+	}
+
+	return selected;
+}
+
 function clearDeadTaskCompletionTimers() {
 	for (const timer of deadTaskCompletionTimers.values()) clearTimeout(timer);
 	deadTaskCompletionTimers.clear();
@@ -1716,7 +1765,14 @@ function sendPlayerSnapshot(socket, playerId) {
 	const info = authToPlayer[playerId];
 	if (deadAuths.has(playerId)) socket.emit('player-dead');
 	if (info?.role === 'Impostor') impostorIds.add(socket.id);
-	if (info?.role) socket.emit('role', info.role);
+	if (info?.role) {
+		const fellowImpostors = info.role === 'Impostor'
+			? Array.from(impostorAuths)
+				.filter(auth => auth !== playerId)
+				.map(auth => playerDirectory[auth]?.name || auth)
+			: [];
+		socket.emit('role', { role: info.role, fellowImpostors });
+	}
 	if (info?.tasks) socket.emit('tasks', info.tasks);
 	socket.emit('tasks-completed', getCompletionMapForAuth(playerId));
 	for (const [taskId, progress] of Object.entries(taskActionProgressByAuth[playerId] || {})) {
@@ -1791,6 +1847,7 @@ function getPersistentSnapshot() {
 		meetingResults,
 		impostorCompletedTasksByAuth,
 		impostorAuths: Array.from(impostorAuths),
+		impostorAssignmentCountsByAuth,
 		killCooldownEndMsByAuth,
 		deadAuths: Array.from(deadAuths),
 		deadTaskNextCompletionAtByAuth,
@@ -1834,6 +1891,10 @@ function loadPersistentState() {
 			!Array.isArray(saved.deadAuths) ||
 			!Array.isArray(saved.sabotageUsedAuths) ||
 			(saved.sabotageDefuserAuths !== undefined && !Array.isArray(saved.sabotageDefuserAuths)) ||
+			(saved.impostorAssignmentCountsByAuth !== undefined &&
+				(!isRecord(saved.impostorAssignmentCountsByAuth) ||
+					!Object.values(saved.impostorAssignmentCountsByAuth).every(value =>
+						Number.isInteger(value) && value >= 0))) ||
 			!Array.isArray(saved.gameConfig.tasks) ||
 			!saved.gameConfig.tasks.every(task => typeof task === 'string' || isValidTask(task)) ||
 			!Object.entries(saved.playerDirectory).every(([id, player]) =>
@@ -1948,6 +2009,10 @@ function loadPersistentState() {
 			}
 		}
 		authToPlayer = Object.assign(Object.create(null), saved.authToPlayer);
+		impostorAssignmentCountsByAuth = Object.assign(
+			Object.create(null),
+			saved.impostorAssignmentCountsByAuth || {}
+		);
 		for (const player of Object.values(authToPlayer)) {
 			player.tasks = Object.fromEntries(
 				Object.entries(player.tasks || {}).map(([taskId, task]) => [taskId, normalizeTask(task)])

@@ -404,6 +404,7 @@ export default function Player() {
   const scannerStreamRef = useRef(null);
   const [progress, setProgress] = useState(0);
   const [role, setRole] = useState('');
+  const [fellowImpostors, setFellowImpostors] = useState([]);
   const [authId, setAuthId] = useState('');
   const [playerName, setPlayerName] = useState(() => {
     try {
@@ -600,6 +601,7 @@ export default function Player() {
       setTasks({});
       setCompleted({});
       setRole('');
+      setFellowImpostors([]);
       setIsImpostor(false);
       setLoginError('Your saved player profile was removed by the admin. Enter your name to join again.');
       socket.disconnect();
@@ -658,10 +660,15 @@ export default function Player() {
           : book)
       }));
     });
-    socket.on('role', (r) => {
-      setRole(r || '');
-      setIsImpostor(r === 'Impostor');
-      if (r !== 'Impostor') {
+    socket.on('role', (payload) => {
+      const nextRole = typeof payload === 'string' ? payload : payload?.role || '';
+      const fellowPlayers = typeof payload === 'object' && Array.isArray(payload?.fellowImpostors)
+        ? payload.fellowImpostors
+        : [];
+      setRole(nextRole);
+      setFellowImpostors(nextRole === 'Impostor' ? fellowPlayers : []);
+      setIsImpostor(nextRole === 'Impostor');
+      if (nextRole !== 'Impostor') {
         killCooldownEndMsRef.current = 0;
         setKillCooldownRemainingMs(0);
       }
@@ -1536,8 +1543,17 @@ export default function Player() {
       )}
 
       {role ? (
-        <Alert severity="info">
-          You are {role === 'Impostor' ? 'an' : 'a'} {role}.
+        <Alert severity={role === 'Impostor' ? 'error' : 'info'}>
+          <Stack spacing={0.5}>
+            <Typography>
+              You are {role === 'Impostor' ? 'an' : 'a'} {role}.
+            </Typography>
+            {role === 'Impostor' && fellowImpostors.length > 0 && (
+              <Typography variant="body2">
+                Fellow impostors: {fellowImpostors.join(', ')}
+              </Typography>
+            )}
+          </Stack>
         </Alert>
       ) : null}
       {isDead && <Alert severity="warning">You are eliminated and can no longer complete tasks.</Alert>}

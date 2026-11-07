@@ -805,6 +805,23 @@ export default function Admin() {
         socketRef.current?.emit('end-game');
     }
 
+    function resetImpostorFairness() {
+        if (!socketRef.current?.connected || !window.confirm('Reset the Impostor fairness statistics for all players?')) return;
+        setPlayerManagementMessage('');
+        socketRef.current?.timeout(10000).emit('reset-impostor-fairness', (timeoutError, response) => {
+            if (timeoutError || !response?.ok) {
+                const messages = {
+                    'game-active': 'End the current game before resetting fairness statistics.',
+                    'persistence-unavailable': 'The fairness statistics could not be saved.',
+                    unauthorized: 'Your admin session has expired. Sign in again.'
+                };
+                setPlayerManagementMessage(messages[response?.reason] || 'Could not reset fairness statistics.');
+                return;
+            }
+            setPlayerManagementMessage('Impostor fairness statistics were reset.');
+        });
+    }
+
     function removePlayer(player) {
         if (gameActive || !window.confirm(`Remove ${player.name} from the saved player list?`)) return;
         setPlayerManagementMessage('');
@@ -1255,6 +1272,14 @@ export default function Admin() {
                                         onClick={exportBooks}
                                     >
                                         Export ISBNs
+                                    </Button>
+                                    <Button
+                                        variant="outlined"
+                                        color="warning"
+                                        onClick={resetImpostorFairness}
+                                        disabled={!isConnected || gameActive}
+                                    >
+                                        Reset Impostor Fairness
                                     </Button>
                                 </>
                             )}
