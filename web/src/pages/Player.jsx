@@ -457,6 +457,7 @@ export default function Player() {
   const [isImpostor, setIsImpostor] = useState(false);
   const [hasUsedSabotage, setHasUsedSabotage] = useState(false);
   const [killCooldownRemainingMs, setKillCooldownRemainingMs] = useState(0);
+  const killCooldownEndMsRef = useRef(0);
   const [mapOpen, setMapOpen] = useState(false);
   const [mapUrl, setMapUrl] = useState('');
   const [audioReady, setAudioReady] = useState(false);
@@ -690,7 +691,14 @@ export default function Player() {
           : book)
       }));
     });
-    socket.on('role', (r) => { setRole(r || ''); setIsImpostor(r === 'Impostor'); });
+    socket.on('role', (r) => {
+      setRole(r || '');
+      setIsImpostor(r === 'Impostor');
+      if (r !== 'Impostor') {
+        killCooldownEndMsRef.current = 0;
+        setKillCooldownRemainingMs(0);
+      }
+    });
     socket.on('play-meeting', async () => {
       await playerActionsRef.current.playSound('/sounds/meeting.mp3');
       await waitMs(2000);
@@ -753,6 +761,8 @@ export default function Player() {
     });
     socket.on('game-ended', () => {
       playerActionsRef.current.stopAllSounds();
+      killCooldownEndMsRef.current = 0;
+      setKillCooldownRemainingMs(0);
       setHasUsedSabotage(false);
       setSabotageEndMs(0);
       setSabotageRemainingMs(0);
@@ -825,7 +835,9 @@ export default function Player() {
       setHasUsedSabotage(!!used);
     });
     socket.on('kill-cooldown-updated', ({ endMs }) => {
-      const remaining = endMs - Date.now();
+      const nextEndMs = Number.isFinite(endMs) ? endMs : 0;
+      killCooldownEndMsRef.current = nextEndMs;
+      const remaining = nextEndMs - Date.now();
       setKillCooldownRemainingMs(Math.max(0, remaining));
     });
     socket.on('game-won', async (result) => {
@@ -1216,13 +1228,13 @@ export default function Player() {
 
   const disableTasks = meeting || !gameActive || isDead;
   useEffect(() => {
-    const i = setInterval(() => {
-      setKillCooldownRemainingMs((prev) => {
-        const next = prev - 1000;
-        return next > 0 ? next : 0;
-      });
-    }, 1000);
-    return () => clearInterval(i);
+    const updateKillCooldown = () => {
+      const remaining = Math.max(0, killCooldownEndMsRef.current - Date.now());
+      setKillCooldownRemainingMs(remaining);
+    };
+    updateKillCooldown();
+    const interval = window.setInterval(updateKillCooldown, 250);
+    return () => window.clearInterval(interval);
   }, []);
 
   // Unlock audio on any mobile/desktop user interaction until unlocked
