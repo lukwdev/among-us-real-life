@@ -520,24 +520,14 @@ io.on('connection', socket => {
 			return reply({ ok: false, reason: 'name-in-use' });
 		}
 
-		const token = typeof payload?.token === 'string' && payload.token.trim() ? payload.token.trim() : null;
 		const existingPlayer = playerDirectory[playerKey];
 		if (!existingPlayer) {
-			const playerToken = token || crypto.randomUUID();
-			playerDirectory[playerKey] = { id: playerKey, name, token: playerToken, lastSeenMs: Date.now() };
+			playerDirectory[playerKey] = { id: playerKey, name, lastSeenMs: Date.now() };
 			if (!persistState()) {
 				delete playerDirectory[playerKey];
 				return reply({ ok: false, reason: 'persistence-unavailable' });
 			}
 		} else {
-			// If an existing player has a session token, incoming request must supply it
-			if (existingPlayer.token && (!token || token !== existingPlayer.token)) {
-				return reply({ ok: false, reason: 'unauthorized-name' });
-			}
-			// Legacy support: if player had no token stored in previous state, initialize it
-			if (!existingPlayer.token) {
-				existingPlayer.token = token || crypto.randomUUID();
-			}
 			if (existingPlayer.name !== name) {
 				const previousName = existingPlayer.name;
 				existingPlayer.name = name;
@@ -549,13 +539,11 @@ io.on('connection', socket => {
 		}
 
 		socket.data.playerId = playerKey;
-		socket.data.playerToken = playerDirectory[playerKey].token;
 		socketIdToAuth[socket.id] = playerKey;
 		reply({
 			ok: true,
 			id: playerKey,
-			name: playerDirectory[playerKey].name,
-			token: playerDirectory[playerKey].token
+			name: playerDirectory[playerKey].name
 		});
 		socket.emit('state', getStateSnapshot(false));
 		sendPlayerSnapshot(socket, playerKey);

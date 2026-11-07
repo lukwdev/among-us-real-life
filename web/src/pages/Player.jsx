@@ -474,15 +474,6 @@ export default function Player() {
   const swLastTickRef = useRef(0);
   const playerCodeRef = useRef(playerCode);
   playerCodeRef.current = playerCode;
-  const [playerToken, setPlayerToken] = useState(() => {
-    try {
-      return localStorage.getItem('playerSessionToken') || '';
-    } catch {
-      return '';
-    }
-  });
-  const playerTokenRef = useRef(playerToken);
-  playerTokenRef.current = playerToken;
 
   // Voting state
   const [playersList, setPlayersList] = useState([]);
@@ -538,14 +529,12 @@ export default function Player() {
       setIsConnected(false);
       socket.timeout(10000).emit('player-login', {
         name: playerName,
-        code: playerCodeRef.current,
-        token: playerTokenRef.current
+        code: playerCodeRef.current
       }, (timeoutError, response) => {
         if (timeoutError || !response?.ok) {
           const messages = {
             'invalid-name': 'Enter a name between 1 and 32 characters.',
             'name-in-use': 'That name is already connected. Choose a different name.',
-            'unauthorized-name': 'This name is registered to another device. Choose a different name.',
             'invalid-player-code': 'The player access code is incorrect.',
             'player-code-not-configured': 'The server has not configured a player access code.',
             'rate-limited': `Too many login attempts. Please wait ${response?.retryAfterSec ?? 120} seconds before trying again.`,
@@ -559,15 +548,6 @@ export default function Player() {
             }
             setPlayerCode('');
           }
-          if (response?.reason === 'unauthorized-name') {
-            try {
-              localStorage.removeItem('playerName');
-              localStorage.removeItem('playerSessionToken');
-            } catch { /* storage is optional */ }
-            setPlayerName('');
-            setPlayerToken('');
-            playerTokenRef.current = '';
-          }
           setLoginError(messages[response?.reason] || 'Could not connect to the game. Please try again.');
           socket.disconnect();
           return;
@@ -575,15 +555,6 @@ export default function Player() {
         setLoginError('');
         setAuthId(response.id);
         setIsConnected(true);
-        if (response.token) {
-          setPlayerToken(response.token);
-          playerTokenRef.current = response.token;
-          try {
-            localStorage.setItem('playerSessionToken', response.token);
-          } catch {
-            console.warn('Could not save the player session token.');
-          }
-        }
         try {
           localStorage.setItem('playerName', response.name);
           if (playerCodeRef.current) {
@@ -620,15 +591,12 @@ export default function Player() {
       try {
         localStorage.removeItem('playerName');
         localStorage.removeItem('playerJoinCode');
-        localStorage.removeItem('playerSessionToken');
         localStorage.removeItem(`imp_completed_${authIdRef.current}`);
       } catch (error) {
         console.warn('Could not clear saved player data after roster removal.', error);
       }
       setPlayerName('');
       setNameInput('');
-      setPlayerToken('');
-      playerTokenRef.current = '';
       setAuthId('');
       setTasks({});
       setCompleted({});
@@ -928,16 +896,6 @@ export default function Player() {
       localStorage.setItem('playerJoinCode', playerCode);
     } catch {
       console.warn('Could not save the player access code in browser storage.');
-    }
-    const storedName = (() => {
-      try { return localStorage.getItem('playerName') || ''; } catch { return ''; }
-    })();
-    if (name.toLowerCase() !== storedName.toLowerCase()) {
-      try {
-        localStorage.removeItem('playerSessionToken');
-      } catch { /* storage is optional */ }
-      setPlayerToken('');
-      playerTokenRef.current = '';
     }
     setPlayerName(name);
     setLoginAttempt((attempt) => attempt + 1);
