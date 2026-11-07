@@ -1033,6 +1033,10 @@ export default function Player() {
       setPushMessage('Camera scanning is not supported on this browser/device. Enter the value manually.');
       return;
     }
+    if (!window.isSecureContext) {
+      setPushMessage('Camera scanning requires HTTPS. Open the game through a secure HTTPS link or enter the value manually.');
+      return;
+    }
     setScannerTaskId(taskId);
   }
 
@@ -1046,7 +1050,12 @@ export default function Player() {
     const scan = async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
         });
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop());
@@ -1054,9 +1063,13 @@ export default function Player() {
         }
         scannerStreamRef.current = stream;
         if (scannerVideoRef.current) {
-          scannerVideoRef.current.srcObject = stream;
-          scannerVideoRef.current.setAttribute('playsinline', 'true');
-          await scannerVideoRef.current.play();
+          const video = scannerVideoRef.current;
+          video.srcObject = stream;
+          video.muted = true;
+          video.autoplay = true;
+          video.playsInline = true;
+          video.setAttribute('webkit-playsinline', 'true');
+          await video.play();
         }
 
         let detector = null;
@@ -1097,7 +1110,7 @@ export default function Player() {
 
             if (!detectedValue && ctx && video.videoWidth && video.videoHeight) {
               try {
-                if (!detector && !jsQRModule) {
+                if (!jsQRModule) {
                   const mod = await import('jsqr');
                   jsQRModule = mod.default || mod;
                 }
@@ -1107,7 +1120,7 @@ export default function Player() {
                   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
                   const code = jsQRModule(imageData.data, imageData.width, imageData.height, {
-                    inversionAttempts: 'dontInvert'
+                    inversionAttempts: 'attemptBoth'
                   });
                   if (code?.data) {
                     detectedValue = code.data;
@@ -1134,7 +1147,12 @@ export default function Player() {
         animId = window.requestAnimationFrame(tick);
       } catch (error) {
         console.warn('Could not start QR scanner.', error);
-        setPushMessage('Could not start camera. Check permissions in browser settings.');
+        const message = error?.name === 'NotAllowedError'
+          ? 'Camera access was denied. Allow camera access for this website in iPhone Settings or Safari, then try again.'
+          : error?.name === 'NotFoundError'
+            ? 'No camera was found. Enter the QR value manually.'
+            : 'Could not start camera. Check HTTPS and browser permissions, then try again.';
+        setPushMessage(message);
         stopQrScanner();
       }
     };
@@ -1684,7 +1702,14 @@ export default function Player() {
       <Dialog open={!!scannerTaskId} onClose={stopQrScanner}>
         <DialogContent>
           <Typography gutterBottom>Point the camera at the task QR code.</Typography>
-          <Box ref={scannerVideoRef} component="video" muted playsInline sx={{ width: 'min(80vw, 420px)', display: 'block' }} />
+          <Box
+            ref={scannerVideoRef}
+            component="video"
+            muted
+            autoPlay
+            playsInline
+            sx={{ width: 'min(80vw, 420px)', minHeight: 220, display: 'block', objectFit: 'cover', backgroundColor: '#000' }}
+          />
           <Button fullWidth sx={{ mt: 1 }} onClick={stopQrScanner}>Cancel</Button>
         </DialogContent>
       </Dialog>
