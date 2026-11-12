@@ -63,6 +63,8 @@ function MeetingOverlay({
   players,
   authId,
   isDead,
+  meetingPhase,
+  meetingPhaseEndMs,
   voteCount,
   hasVoted,
   selectedTarget,
@@ -70,11 +72,19 @@ function MeetingOverlay({
   onConfirmVote,
   results
 }) {
-  if (!open) return null;
-
   const participants = (players || []).filter((p) => p.inGame !== false);
   const living = participants.filter((p) => p.alive !== false);
   const dead = participants.filter((p) => p.alive === false);
+  const phaseLabel = meetingPhase === 'discussion' ? 'Discussion' : meetingPhase === 'voting' ? 'Voting' : 'Results';
+  const [phaseNow, setPhaseNow] = useState(Date.now());
+  useEffect(() => {
+    if (!open || !meetingPhaseEndMs) return undefined;
+    const timer = window.setInterval(() => setPhaseNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [open, meetingPhaseEndMs]);
+  const phaseRemaining = meetingPhaseEndMs ? Math.max(0, Math.ceil((meetingPhaseEndMs - phaseNow) / 1000)) : 0;
+
+  if (!open) return null;
 
   const isReport = caller?.type === 'report';
 
@@ -130,6 +140,11 @@ function MeetingOverlay({
                 variant="outlined"
                 sx={{ mt: 0.5 }}
               />
+              {!results && (
+                <Typography variant="body2" color="text.secondary">
+                  {phaseLabel} · {phaseRemaining}s remaining
+                </Typography>
+              )}
             </Stack>
           </CardContent>
         </Card>
@@ -208,6 +223,8 @@ function MeetingOverlay({
             >
               {isDead
                 ? 'You have been eliminated. Ghosts cannot vote.'
+                : meetingPhase === 'discussion'
+                ? 'Discuss who might be the Impostor. Voting will open when the timer ends.'
                 : hasVoted
                 ? 'Your vote has been recorded. Waiting for others…'
                 : 'Select a player to eject or vote to skip.'}
@@ -222,7 +239,7 @@ function MeetingOverlay({
               {living.map((player) => {
                 const isSelected = selectedTarget === player.id;
                 const isSelf = player.id === authId;
-                const canVote = !hasVoted && !isDead;
+                const canVote = meetingPhase === 'voting' && !hasVoted && !isDead;
 
                 return (
                   <Card
@@ -283,15 +300,15 @@ function MeetingOverlay({
 
             {/* Skip Vote Card */}
             <Card
-              onClick={() => { if (!hasVoted && !isDead) onSelectTarget('skip'); }}
+              onClick={() => { if (meetingPhase === 'voting' && !hasVoted && !isDead) onSelectTarget('skip'); }}
               elevation={selectedTarget === 'skip' ? 6 : 1}
               sx={{
-                cursor: !hasVoted && !isDead ? 'pointer' : 'default',
+                cursor: meetingPhase === 'voting' && !hasVoted && !isDead ? 'pointer' : 'default',
                 borderLeft: '3px solid',
                 borderLeftColor: selectedTarget === 'skip' ? 'secondary.main' : 'divider',
                 bgcolor: selectedTarget === 'skip' ? 'action.selected' : 'background.paper',
                 transition: 'border-color 0.15s, background-color 0.15s',
-                '&:hover': !hasVoted && !isDead ? { borderLeftColor: 'secondary.main', bgcolor: 'action.hover' } : {}
+                '&:hover': meetingPhase === 'voting' && !hasVoted && !isDead ? { borderLeftColor: 'secondary.main', bgcolor: 'action.hover' } : {}
               }}
             >
               <CardContent sx={{ py: '10px !important' }}>
@@ -303,7 +320,7 @@ function MeetingOverlay({
                       <Typography variant="caption" color="text.secondary">Don't eject anyone this round</Typography>
                     </Box>
                   </Stack>
-                  {!hasVoted && !isDead && (
+                  {meetingPhase === 'voting' && !hasVoted && !isDead && (
                     <Radio
                       checked={selectedTarget === 'skip'}
                       value="skip"
@@ -339,7 +356,7 @@ function MeetingOverlay({
             )}
 
             {/* Sticky confirm button */}
-            {!hasVoted && !isDead && (
+            {meetingPhase === 'voting' && !hasVoted && !isDead && (
               <Box sx={{ position: 'sticky', bottom: 0, pt: 2, pb: 1, bgcolor: 'background.default', zIndex: 1 }}>
                 <Button
                   variant="contained"
@@ -436,6 +453,7 @@ export default function Player() {
   const [gameActive, setGameActive] = useState(false);
   const [gameWinner, setGameWinner] = useState(null);
   const [isDead, setIsDead] = useState(false);
+  const [ghostMode, setGhostMode] = useState(false);
   const [deadPlayersCanCompleteTasks, setDeadPlayersCanCompleteTasks] = useState(false);
   const [isImpostor, setIsImpostor] = useState(false);
   const [hasUsedSabotage, setHasUsedSabotage] = useState(false);
@@ -461,6 +479,8 @@ export default function Player() {
   // Voting state
   const [playersList, setPlayersList] = useState([]);
   const [meetingCaller, setMeetingCaller] = useState(null);
+  const [meetingPhase, setMeetingPhase] = useState('idle');
+  const [meetingPhaseEndMs, setMeetingPhaseEndMs] = useState(0);
   const [voteCount, setVoteCount] = useState(0);
   const [hasVoted, setHasVoted] = useState(false);
   const [selectedVoteTarget, setSelectedVoteTarget] = useState(null);
@@ -671,6 +691,8 @@ export default function Player() {
     socket.on('meeting-started', (payload) => {
       setMeeting(true);
       setMeetingCaller(payload?.caller || null);
+      setMeetingPhase('discussion');
+      setMeetingPhaseEndMs(0);
       setVoteCount(0);
       setHasVoted(false);
       setSelectedVoteTarget(null);
@@ -680,6 +702,8 @@ export default function Player() {
     socket.on('meeting-ended', () => {
       setMeeting(false);
       setMeetingCaller(null);
+      setMeetingPhase('idle');
+      setMeetingPhaseEndMs(0);
       setVoteCount(0);
       setHasVoted(false);
       setSelectedVoteTarget(null);
@@ -688,12 +712,18 @@ export default function Player() {
     socket.on('meeting-state', (payload) => {
       setMeeting(!!payload?.isMeeting);
       if (payload?.caller) setMeetingCaller(payload.caller);
+      if (payload?.phase) setMeetingPhase(payload.phase);
+      if (typeof payload?.phaseEndMs === 'number') setMeetingPhaseEndMs(payload.phaseEndMs);
       if (typeof payload?.voteCount === 'number') setVoteCount(payload.voteCount);
       if (typeof payload?.hasVoted === 'boolean') setHasVoted(payload.hasVoted);
       if (payload?.results) setVotingResults(payload.results);
     });
     socket.on('vote-cast', ({ totalVotes }) => {
       if (typeof totalVotes === 'number') setVoteCount(totalVotes);
+    });
+    socket.on('meeting-phase', ({ phase, phaseEndMs }) => {
+      if (phase) setMeetingPhase(phase);
+      if (typeof phaseEndMs === 'number') setMeetingPhaseEndMs(phaseEndMs);
     });
     socket.on('voting-results', (results) => {
       setVotingResults(results || null);
@@ -714,9 +744,12 @@ export default function Player() {
       setSabotageDefusedCount(0);
       setGameWinner(null);
       setIsDead(false);
+      setGhostMode(false);
       setGameActive(true);
       setMeeting(false);
       setMeetingCaller(null);
+      setMeetingPhase('idle');
+      setMeetingPhaseEndMs(0);
       setVoteCount(0);
       setHasVoted(false);
       setSelectedVoteTarget(null);
@@ -733,8 +766,11 @@ export default function Player() {
       setSabotageChargesRemaining(0);
       setGameActive(false);
       setIsDead(false);
+      setGhostMode(false);
       setMeeting(false);
       setMeetingCaller(null);
+      setMeetingPhase('idle');
+      setMeetingPhaseEndMs(0);
       setVoteCount(0);
       setHasVoted(false);
       setSelectedVoteTarget(null);
@@ -744,6 +780,8 @@ export default function Player() {
     });
     socket.on('state', (s) => {
       setMeeting(!!s?.isMeeting);
+      setMeetingPhase(s?.meetingPhase || (s?.isMeeting ? 'discussion' : 'idle'));
+      setMeetingPhaseEndMs(typeof s?.meetingPhaseEndMs === 'number' ? s.meetingPhaseEndMs : 0);
       setGameActive(!!s?.isGameActive);
       setGameWinner(['crewmates', 'impostors'].includes(s?.gameWinner) ? s.gameWinner : null);
       setDeadPlayersCanCompleteTasks(s?.deadPlayersCanCompleteTasks === true);
@@ -760,6 +798,7 @@ export default function Player() {
       setIsDead(true);
       if (navigator.vibrate) navigator.vibrate([400, 200, 400]);
     });
+    socket.on('ghost-mode', () => setGhostMode(true));
     socket.on('sabotage-started', ({ endMs }) => {
       setSabotageEndMs(endMs || 0);
       setSabotageRemainingMs(Math.max(0, (endMs || 0) - Date.now()));
@@ -1199,7 +1238,7 @@ export default function Player() {
 
   // Players report by clicking the report image, not via keyboard
 
-  const disableTasks = meeting || !gameActive || (isDead && !deadPlayersCanCompleteTasks);
+  const disableTasks = meeting || !gameActive || (isDead && (!deadPlayersCanCompleteTasks || !ghostMode));
   useEffect(() => {
     const updateKillCooldown = () => {
       const remaining = Math.max(0, killCooldownEndMsRef.current - Date.now());
@@ -1406,6 +1445,8 @@ export default function Player() {
           players={playersList}
           authId={authId}
           isDead={isDead}
+          meetingPhase={meetingPhase}
+          meetingPhaseEndMs={meetingPhaseEndMs}
           voteCount={voteCount}
           hasVoted={hasVoted}
           selectedTarget={selectedVoteTarget}
@@ -1692,6 +1733,8 @@ export default function Player() {
         players={playersList}
         authId={authId}
         isDead={isDead}
+        meetingPhase={meetingPhase}
+        meetingPhaseEndMs={meetingPhaseEndMs}
         voteCount={voteCount}
         hasVoted={hasVoted}
         selectedTarget={selectedVoteTarget}

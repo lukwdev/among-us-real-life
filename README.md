@@ -53,6 +53,8 @@ For background meeting, game-start, sabotage, voting-result, and game-win notifi
 
 Socket.IO buffers missed events for player reconnects for 30 minutes by default. Change `SOCKET_RECOVERY_MINUTES` in the root `.env` if a different recovery window is needed.
 
+Meetings use a 30-second discussion phase followed by a 60-second voting phase by default. Both timers can be adjusted in the admin game settings. Dead players only enter ghost mode after their death has been reported; if manual dead-player tasks are enabled, they can continue tasks from that point onward.
+
 ```sh
 docker compose up --build -d
 docker compose logs -f

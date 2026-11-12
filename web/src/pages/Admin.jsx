@@ -364,6 +364,8 @@ export default function Admin() {
     const [sessionWarning, setSessionWarning] = useState('');
     const socketRef = useRef(null);
     const [meeting, setMeeting] = useState(false);
+    const [meetingPhase, setMeetingPhase] = useState('idle');
+    const [meetingPhaseEndMs, setMeetingPhaseEndMs] = useState(0);
     const [gameActive, setGameActive] = useState(false);
     const [gameWinner, setGameWinner] = useState(null);
     const [numImpostors, setNumImpostors] = useState('1');
@@ -389,6 +391,8 @@ export default function Admin() {
     const [qrDialog, setQrDialog] = useState({ open: false, title: '', values: [], images: [] });
     const [deadPlayersCanCompleteTasks, setDeadPlayersCanCompleteTasks] = useState(false);
     const [deadTaskCompletionIntervalSeconds, setDeadTaskCompletionIntervalSeconds] = useState('90');
+    const [discussionDurationSeconds, setDiscussionDurationSeconds] = useState('30');
+    const [votingDurationSeconds, setVotingDurationSeconds] = useState('60');
     const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
     const [connectedPlayers, setConnectedPlayers] = useState([]);
     const [startError, setStartError] = useState('');
@@ -477,8 +481,19 @@ export default function Admin() {
             await waitMs(2000);
         });
 
-        socket.on('meeting-started', () => setMeeting(true));
-        socket.on('meeting-ended', () => setMeeting(false));
+        socket.on('meeting-started', () => {
+            setMeeting(true);
+            setMeetingPhase('discussion');
+        });
+        socket.on('meeting-phase', ({ phase, phaseEndMs }) => {
+            if (phase) setMeetingPhase(phase);
+            if (typeof phaseEndMs === 'number') setMeetingPhaseEndMs(phaseEndMs);
+        });
+        socket.on('meeting-ended', () => {
+            setMeeting(false);
+            setMeetingPhase('idle');
+            setMeetingPhaseEndMs(0);
+        });
         socket.on('game-started', () => setGameActive(true));
         socket.on('game-ended', () => { setGameActive(false); setMeeting(false); setCooldownRemainingMs(0); });
         socket.on('game-won', (result) => {
@@ -486,6 +501,8 @@ export default function Admin() {
         });
         socket.on('state', (s) => {
             setMeeting(!!s?.isMeeting);
+            setMeetingPhase(s?.meetingPhase || (s?.isMeeting ? 'discussion' : 'idle'));
+            setMeetingPhaseEndMs(typeof s?.meetingPhaseEndMs === 'number' ? s.meetingPhaseEndMs : 0);
             setGameActive(!!s?.isGameActive);
             setGameWinner(['crewmates', 'impostors'].includes(s?.gameWinner) ? s.gameWinner : null);
             if (typeof s?.emergencyCooldownEndMs === 'number') {
@@ -507,6 +524,12 @@ export default function Admin() {
                 }
                 if (typeof s.config.deadTaskCompletionIntervalSeconds === 'number') {
                     setDeadTaskCompletionIntervalSeconds(String(s.config.deadTaskCompletionIntervalSeconds));
+                }
+                if (typeof s.config.discussionDurationSeconds === 'number') {
+                    setDiscussionDurationSeconds(String(s.config.discussionDurationSeconds));
+                }
+                if (typeof s.config.votingDurationSeconds === 'number') {
+                    setVotingDurationSeconds(String(s.config.votingDurationSeconds));
                 }
             }
             if (Array.isArray(s?.taskCollections)) {
@@ -602,6 +625,12 @@ export default function Admin() {
             deadPlayersCanCompleteTasks,
             deadTaskCompletionIntervalSeconds: Number.isFinite(parseInt(deadTaskCompletionIntervalSeconds, 10))
                 ? parseInt(deadTaskCompletionIntervalSeconds, 10)
+                : undefined,
+            discussionDurationSeconds: Number.isFinite(parseInt(discussionDurationSeconds, 10))
+                ? parseInt(discussionDurationSeconds, 10)
+                : undefined,
+            votingDurationSeconds: Number.isFinite(parseInt(votingDurationSeconds, 10))
+                ? parseInt(votingDurationSeconds, 10)
                 : undefined
         };
         setTaskCollections(nextCollections);
@@ -1271,6 +1300,24 @@ export default function Admin() {
                                                 : 'One unfinished task from a dead crewmate is completed after each interval.'}
                                             fullWidth
                                         />
+                                        <TextField
+                                            label="Discussion Timer (seconds)"
+                                            value={discussionDurationSeconds}
+                                            onChange={(e) => setDiscussionDurationSeconds(e.target.value)}
+                                            inputMode="numeric"
+                                            inputProps={{ min: 0 }}
+                                            helperText="Time to discuss before voting opens."
+                                            fullWidth
+                                        />
+                                        <TextField
+                                            label="Voting Timer (seconds)"
+                                            value={votingDurationSeconds}
+                                            onChange={(e) => setVotingDurationSeconds(e.target.value)}
+                                            inputMode="numeric"
+                                            inputProps={{ min: 1 }}
+                                            helperText="Voting ends automatically when this reaches zero."
+                                            fullWidth
+                                        />
                                         <FormControlLabel
                                             control={(
                                                 <Checkbox
@@ -1307,9 +1354,12 @@ export default function Admin() {
                             )}
                             {showContinue && (
                                 <>
-                                    <Typography variant="h5" color="error">MEETING IN PROGRESS</Typography>
+                                    <Typography variant="h5" color="error">
+                                        {meetingPhase === 'discussion' ? 'DISCUSSION' : meetingPhase === 'voting' ? 'VOTING' : 'MEETING RESULTS'}
+                                        {meetingPhaseEndMs > Date.now() && ` · ${Math.ceil((meetingPhaseEndMs - Date.now()) / 1000)}s`}
+                                    </Typography>
                                     <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
-                                        <Button variant="outlined" color="warning" onClick={() => socketRef.current?.emit('admin-end-voting')} disabled={!isConnected}>
+                                        <Button variant="outlined" color="warning" onClick={() => socketRef.current?.emit('admin-end-voting')} disabled={!isConnected || meetingPhase !== 'voting'}>
                                             End Voting & Tally
                                         </Button>
                                         <Button variant="contained" onClick={continueGame} disabled={!isConnected}>

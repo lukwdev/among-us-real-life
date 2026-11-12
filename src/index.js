@@ -216,6 +216,9 @@ const DEFAULT_TASKS_PER_PLAYER = N_TASKS;
 
 let taskProgress = Object.create(null);
 let isMeeting = false;
+let meetingPhase = 'idle'; // 'idle' | 'discussion' | 'voting' | 'results'
+let meetingPhaseEndMs = 0;
+let meetingPhaseTimeout = null;
 let isGameActive = false;
 let impostorAssignmentCountsByAuth = Object.create(null);
 const DEFAULT_TASK_COLLECTION_ID = 'default';
@@ -245,7 +248,9 @@ let gameConfig = {
 	// When enabled, dead crewmates complete tasks manually instead of the background timer.
 	deadPlayersCanCompleteTasks: false,
 	// Delay between automatic completion of tasks belonging to dead crewmates
-	deadTaskCompletionIntervalSeconds: 90
+	deadTaskCompletionIntervalSeconds: 90,
+	discussionDurationSeconds: 30,
+	votingDurationSeconds: 60
 };
 let emergencyCooldownEndMs = 0;
 let lastMeetingType = null; // 'emergency' | 'report' | null
@@ -273,6 +278,7 @@ let sabotageChargesRemaining = 0;
 let sabotageDefuserAuths = new Set();
 
 let deadAuths = new Set();
+let reportedDeadAuths = new Set();
 let deadTaskNextCompletionAtByAuth = Object.create(null);
 const deadTaskCompletionTimers = new Map();
 let gameWinner = null;
@@ -828,6 +834,12 @@ io.on('connection', socket => {
 			if (typeof payload.deadPlayersCanCompleteTasks === 'boolean') {
 				gameConfig.deadPlayersCanCompleteTasks = payload.deadPlayersCanCompleteTasks;
 			}
+			if (typeof payload.discussionDurationSeconds === 'number' && payload.discussionDurationSeconds >= 0) {
+				gameConfig.discussionDurationSeconds = payload.discussionDurationSeconds;
+			}
+			if (typeof payload.votingDurationSeconds === 'number' && payload.votingDurationSeconds > 0) {
+				gameConfig.votingDurationSeconds = payload.votingDurationSeconds;
+			}
 			if (gameConfig.sabotageMode === 'qr' && gameConfig.sabotageQrCodes.length < 2) {
 				return socket.emit('start-error', { reason: 'invalid-sabotage-qr-config' });
 			}
@@ -883,6 +895,7 @@ io.on('connection', socket => {
 		killCooldownEndMsBySocketId = {};
         //Reset dead players
         deadAuths = new Set();
+        reportedDeadAuths = new Set();
 		deadTaskNextCompletionAtByAuth = Object.create(null);
 		clearDeadTaskCompletionTimers();
 		// Reset sabotage state
@@ -927,6 +940,9 @@ io.on('connection', socket => {
 		meetingCaller = null;
 		meetingVotes = Object.create(null);
 		meetingResults = null;
+		meetingPhase = 'idle';
+		meetingPhaseEndMs = 0;
+		clearMeetingPhaseTimeout();
 		gameLog = [];
 		appendGameLog('game-started', 'Game started', { players: uniqueAuths.length, impostors: impostorAuths.size });
 
@@ -1008,6 +1024,13 @@ io.on('connection', socket => {
 			io.emit('sabotage-ended', { reason: 'meeting' });
 			appendGameLog('sabotage-cleared', 'Sabotage cleared by reported body');
 		}
+		for (const auth of deadAuths) {
+			reportedDeadAuths.add(auth);
+			for (const s of io.of('/').sockets.values()) {
+				if (s.data.playerId === auth) s.emit('ghost-mode');
+			}
+			if (!impostorAuths.has(auth)) scheduleDeadTaskCompletion(auth);
+		}
 		isMeeting = true;
 		lastMeetingType = 'report';
 		const callerName = playerDirectory[callerAuth]?.name || callerAuth;
@@ -1016,6 +1039,7 @@ io.on('connection', socket => {
 		meetingResults = null;
 		io.emit('play-meeting');
 		io.emit('meeting-started', { caller: meetingCaller });
+		startMeetingPhase('discussion');
 		void sendPushNotification('Dead body reported', `${callerName} reported a body. Return for the meeting.`, 'among-us-meeting');
 		persistState();
 		console.log('[report]', { socketId: socket.id, auth: callerAuth });
@@ -1037,6 +1061,7 @@ io.on('connection', socket => {
 		meetingResults = null;
 		io.emit('play-meeting');
 		io.emit('meeting-started', { caller: meetingCaller });
+		startMeetingPhase('discussion');
 		void sendPushNotification('Emergency meeting', `${callerName} called an emergency meeting.`, 'among-us-meeting');
 		persistState();
 		console.log('[emergency-meeting]', { socketId: socket.id, auth: callerAuth });
@@ -1045,7 +1070,7 @@ io.on('connection', socket => {
 	});
 
 	socket.on('cast-vote', payload => {
-		if (!socket.data.playerId || !isGameActive || !isMeeting || meetingResults) return;
+		if (!socket.data.playerId || !isGameActive || !isMeeting || meetingPhase !== 'voting' || meetingResults) return;
 		const voterAuth = socketIdToAuth[socket.id];
 		if (!voterAuth || deadAuths.has(voterAuth)) return;
 		if (meetingVotes[voterAuth]) return;
@@ -1066,7 +1091,7 @@ io.on('connection', socket => {
 	});
 
 	socket.on('admin-end-voting', () => {
-		if (!isAuthenticatedAdmin(socket) || !isGameActive || !isMeeting || meetingResults) return;
+		if (!isAuthenticatedAdmin(socket) || !isGameActive || !isMeeting || meetingPhase !== 'voting' || meetingResults) return;
 		concludeVoting();
 	});
 
@@ -1078,7 +1103,11 @@ io.on('connection', socket => {
 			return reply({ ok: false, reason: 'invalid-player' });
 		}
 		deadAuths.add(playerId);
-		if (!impostorAuths.has(playerId) && !gameConfig.deadPlayersCanCompleteTasks) {
+		reportedDeadAuths.add(playerId);
+		for (const playerSocket of io.of('/').sockets.values()) {
+			if (playerSocket.data.playerId === playerId) playerSocket.emit('ghost-mode');
+		}
+		if (!impostorAuths.has(playerId)) {
 			deadTaskNextCompletionAtByAuth[playerId] = Date.now() +
 				Math.max(1, Number(gameConfig.deadTaskCompletionIntervalSeconds || 90)) * 1000;
 			scheduleDeadTaskCompletion(playerId);
@@ -1103,6 +1132,9 @@ io.on('connection', socket => {
 	socket.on('continue-game', () => {
 		if (!isAuthenticatedAdmin(socket) || !isGameActive) return;
 		isMeeting = false;
+		meetingPhase = 'idle';
+		meetingPhaseEndMs = 0;
+		clearMeetingPhaseTimeout();
 		meetingCaller = null;
 		meetingVotes = Object.create(null);
 		meetingResults = null;
@@ -1133,6 +1165,9 @@ io.on('connection', socket => {
 	socket.on('end-game', () => {
 		if (!isAuthenticatedAdmin(socket) || (!isGameActive && !gameWinner)) return;
 		isMeeting = false;
+		meetingPhase = 'idle';
+		meetingPhaseEndMs = 0;
+		clearMeetingPhaseTimeout();
 		isGameActive = false;
 		emergencyCooldownEndMs = 0;
 		impostorIds = new Set();
@@ -1141,6 +1176,7 @@ io.on('connection', socket => {
 		killCooldownEndMsByAuth = Object.create(null);
         // Reset dead players
         deadAuths = new Set();
+		reportedDeadAuths = new Set();
 		deadTaskNextCompletionAtByAuth = Object.create(null);
 		clearDeadTaskCompletionTimers();
 		// Clear sabotage
@@ -1288,7 +1324,7 @@ io.on('connection', socket => {
 		if (!socket.data.playerId || isMeeting || !isGameActive) return;
 		const auth = socketIdToAuth[socket.id];
 		const task = authToPlayer[auth]?.tasks?.[taskId];
-		if (!auth || (deadAuths.has(auth) && !gameConfig.deadPlayersCanCompleteTasks) ||
+		if (!auth || (deadAuths.has(auth) && !deadPlayerCanAct(auth)) ||
 			impostorAuths.has(auth) || !task || task.type !== 'manual') return;
 		const isNewlyCompleted = taskProgress[taskId] === false;
 		if (typeof taskProgress[taskId] === 'boolean') {
@@ -1311,7 +1347,7 @@ io.on('connection', socket => {
 		if (!socket.data.playerId || isMeeting || !isGameActive) return reply({ ok: false, reason: 'unavailable' });
 		const auth = socketIdToAuth[socket.id];
 		const task = authToPlayer[auth]?.tasks?.[taskId];
-		if (!auth || (deadAuths.has(auth) && !gameConfig.deadPlayersCanCompleteTasks) ||
+		if (!auth || (deadAuths.has(auth) && !deadPlayerCanAct(auth)) ||
 			impostorAuths.has(auth) || !task || !['qr', 'isbn'].includes(task.type)) {
 			return reply({ ok: false, reason: 'invalid-task' });
 		}
@@ -1400,7 +1436,7 @@ io.on('connection', socket => {
 		const task = authToPlayer[auth]?.tasks?.[taskId];
 		const isbn = typeof value === 'string' ? normalizeIsbn(value) : '';
 		const progress = taskActionProgressByAuth[auth]?.[taskId];
-		if (!auth || (deadAuths.has(auth) && !gameConfig.deadPlayersCanCompleteTasks) ||
+		if (!auth || (deadAuths.has(auth) && !deadPlayerCanAct(auth)) ||
 			impostorAuths.has(auth) || task?.type !== 'isbn' ||
 			!progress?.values?.includes(isbn)) {
 			return reply({ ok: false, reason: 'not-found' });
@@ -1442,7 +1478,7 @@ io.on('connection', socket => {
 		const task = authToPlayer[auth]?.tasks?.[taskId];
 		const isbn = typeof value === 'string' ? normalizeIsbn(value) : '';
 		const progress = taskActionProgressByAuth[auth]?.[taskId];
-		if (!auth || (deadAuths.has(auth) && !gameConfig.deadPlayersCanCompleteTasks) ||
+		if (!auth || (deadAuths.has(auth) && !deadPlayerCanAct(auth)) ||
 			impostorAuths.has(auth) || task?.type !== 'isbn' ||
 			!progress?.values?.includes(isbn)) {
 			return reply({ ok: false, reason: 'not-found' });
@@ -1471,7 +1507,7 @@ io.on('connection', socket => {
 	socket.on('task-incomplete', taskId => {
 		if (!socket.data.playerId || isMeeting || !isGameActive) return;
 		const auth = socketIdToAuth[socket.id];
-		if (!auth || (deadAuths.has(auth) && !gameConfig.deadPlayersCanCompleteTasks) ||
+		if (!auth || (deadAuths.has(auth) && !deadPlayerCanAct(auth)) ||
 			impostorAuths.has(auth) || !authToPlayer[auth]?.tasks?.[taskId]) return;
 		if (typeof taskProgress[taskId] === 'boolean') {
 			taskProgress[taskId] = false;
@@ -1505,7 +1541,7 @@ io.on('connection', socket => {
         if (impostorAuths.has(auth)) return;
 
         deadAuths.add(auth);
-		if (!gameConfig.deadPlayersCanCompleteTasks) {
+		if (!gameConfig.deadPlayersCanCompleteTasks && reportedDeadAuths.has(auth)) {
 			deadTaskNextCompletionAtByAuth[auth] = Date.now() +
 				Math.max(1, Number(gameConfig.deadTaskCompletionIntervalSeconds || 90)) * 1000;
 			scheduleDeadTaskCompletion(auth);
@@ -1553,8 +1589,42 @@ function getPublicVotingResults(results) {
 	return publicResults;
 }
 
+function clearMeetingPhaseTimeout() {
+	if (meetingPhaseTimeout) {
+		clearTimeout(meetingPhaseTimeout);
+		meetingPhaseTimeout = null;
+	}
+}
+
+function startMeetingPhase(phase) {
+	if (!isMeeting || !['discussion', 'voting'].includes(phase)) return;
+	clearMeetingPhaseTimeout();
+	meetingPhase = phase;
+	const durationSeconds = phase === 'discussion'
+		? gameConfig.discussionDurationSeconds
+		: gameConfig.votingDurationSeconds;
+	meetingPhaseEndMs = Date.now() + Math.max(0, Number(durationSeconds || 0)) * 1000;
+	io.emit('meeting-phase', { phase, phaseEndMs: meetingPhaseEndMs });
+	schedulePersist();
+
+	if (phase === 'discussion') {
+		meetingPhaseTimeout = setTimeout(() => {
+			meetingPhaseTimeout = null;
+			if (isMeeting && !meetingResults) startMeetingPhase('voting');
+		}, Math.max(0, meetingPhaseEndMs - Date.now()));
+	} else {
+		meetingPhaseTimeout = setTimeout(() => {
+			meetingPhaseTimeout = null;
+			if (isMeeting && !meetingResults) concludeVoting();
+		}, Math.max(0, meetingPhaseEndMs - Date.now()));
+	}
+}
+
 function concludeVoting() {
 	if (!isMeeting || meetingResults) return;
+	clearMeetingPhaseTimeout();
+	meetingPhase = 'results';
+	meetingPhaseEndMs = 0;
 
 	const livingPlayers = Object.keys(authToPlayer).filter(id => !deadAuths.has(id));
 	const playerNames = Object.fromEntries(
@@ -1570,6 +1640,7 @@ function concludeVoting() {
 	if (meetingResults.ejected) {
 		const ejected = meetingResults.ejected;
 		deadAuths.add(ejected);
+		reportedDeadAuths.add(ejected);
 
 		if (!impostorAuths.has(ejected) && !gameConfig.deadPlayersCanCompleteTasks) {
 			deadTaskNextCompletionAtByAuth[ejected] = Date.now() +
@@ -1671,10 +1742,16 @@ function clearDeadTaskCompletionTimers() {
 	deadTaskCompletionTimers.clear();
 }
 
+function deadPlayerCanAct(auth) {
+	return !deadAuths.has(auth) ||
+		(gameConfig.deadPlayersCanCompleteTasks && reportedDeadAuths.has(auth));
+}
+
 function scheduleDeadTaskCompletion(auth) {
 	if (deadTaskCompletionTimers.has(auth) ||
 		!isGameActive ||
 		gameConfig.deadPlayersCanCompleteTasks ||
+		!reportedDeadAuths.has(auth) ||
 		!deadAuths.has(auth) ||
 		impostorAuths.has(auth)) return;
 
@@ -1694,7 +1771,7 @@ function scheduleDeadTaskCompletion(auth) {
 		deadTaskCompletionTimers.delete(auth);
 		const nextTaskId = Object.keys(authToPlayer[auth]?.tasks || {})
 			.find(taskId => taskProgress[taskId] === false);
-		if (!isGameActive || !deadAuths.has(auth) || !nextTaskId) {
+		if (!isGameActive || !deadAuths.has(auth) || !reportedDeadAuths.has(auth) || !nextTaskId) {
 			delete deadTaskNextCompletionAtByAuth[auth];
 			schedulePersist();
 			return;
@@ -1809,7 +1886,10 @@ function broadcastGamemasterUpdate() {
 
 function sendPlayerSnapshot(socket, playerId) {
 	const info = authToPlayer[playerId];
-	if (deadAuths.has(playerId)) socket.emit('player-dead');
+	if (deadAuths.has(playerId)) {
+		socket.emit('player-dead');
+		if (reportedDeadAuths.has(playerId)) socket.emit('ghost-mode');
+	}
 	if (info?.role === 'Impostor') impostorIds.add(socket.id);
 	if (info?.role) {
 		const fellowImpostors = info.role === 'Impostor'
@@ -1865,6 +1945,8 @@ function sendPlayerSnapshot(socket, playerId) {
 		socket.emit('meeting-state', {
 			isMeeting: true,
 			caller: meetingCaller,
+			phase: meetingPhase,
+			phaseEndMs: meetingPhaseEndMs,
 			voteCount: Object.keys(meetingVotes).length,
 			hasVoted: Boolean(meetingVotes[playerId]),
 			results: getPublicVotingResults(meetingResults)
@@ -1887,6 +1969,8 @@ function getPersistentSnapshot() {
 		isMeeting,
 		isGameActive,
 		emergencyCooldownEndMs,
+		meetingPhase,
+		meetingPhaseEndMs,
 		lastMeetingType,
 		meetingCaller,
 		meetingVotes,
@@ -1896,6 +1980,7 @@ function getPersistentSnapshot() {
 		impostorAssignmentCountsByAuth,
 		killCooldownEndMsByAuth,
 		deadAuths: Array.from(deadAuths),
+		reportedDeadAuths: Array.from(reportedDeadAuths),
 		deadTaskNextCompletionAtByAuth,
 		isSabotageActive,
 		sabotageEndMs,
@@ -1935,6 +2020,7 @@ function loadPersistentState() {
 		if (recordFields.some(field => !isRecord(saved[field])) ||
 			!Array.isArray(saved.impostorAuths) ||
 			!Array.isArray(saved.deadAuths) ||
+			(saved.reportedDeadAuths !== undefined && !Array.isArray(saved.reportedDeadAuths)) ||
 			!Array.isArray(saved.sabotageUsedAuths) ||
 			(saved.sabotageDefuserAuths !== undefined && !Array.isArray(saved.sabotageDefuserAuths)) ||
 			(saved.impostorAssignmentCountsByAuth !== undefined &&
@@ -1952,6 +2038,7 @@ function loadPersistentState() {
 			!Object.values(saved.taskProgress).every(value => typeof value === 'boolean') ||
 			saved.impostorAuths.concat(
 				saved.deadAuths,
+				saved.reportedDeadAuths || [],
 				saved.sabotageUsedAuths,
 				saved.sabotageDefuserAuths || []
 			).some(value => typeof value !== 'string')) {
@@ -1965,7 +2052,9 @@ function loadPersistentState() {
 			'maxPlayersPerTask',
 			'sabotageDurationSeconds',
 			'sabotageCharges',
-			'deadTaskCompletionIntervalSeconds'
+			'deadTaskCompletionIntervalSeconds',
+			'discussionDurationSeconds',
+			'votingDurationSeconds'
 		];
 		if (numericConfigKeys.some(key =>
 			saved.gameConfig[key] !== undefined &&
@@ -2081,6 +2170,7 @@ function loadPersistentState() {
 		impostorAuths = new Set(Array.isArray(saved.impostorAuths) ? saved.impostorAuths : []);
 		killCooldownEndMsByAuth = Object.assign(Object.create(null), saved.killCooldownEndMsByAuth);
 		deadAuths = new Set(Array.isArray(saved.deadAuths) ? saved.deadAuths : []);
+		reportedDeadAuths = new Set(Array.isArray(saved.reportedDeadAuths) ? saved.reportedDeadAuths : []);
 		deadTaskNextCompletionAtByAuth = Object.assign(
 			Object.create(null),
 			saved.deadTaskNextCompletionAtByAuth || {}
@@ -2099,6 +2189,21 @@ function loadPersistentState() {
 		meetingCaller = isRecord(saved.meetingCaller) ? saved.meetingCaller : null;
 		meetingVotes = isRecord(saved.meetingVotes) ? saved.meetingVotes : Object.create(null);
 		meetingResults = isRecord(saved.meetingResults) ? saved.meetingResults : null;
+		meetingPhase = ['discussion', 'voting', 'results'].includes(saved.meetingPhase)
+			? saved.meetingPhase
+			: (meetingResults ? 'results' : isMeeting ? 'discussion' : 'idle');
+		meetingPhaseEndMs = Number(saved.meetingPhaseEndMs) || 0;
+		if (isMeeting && !meetingResults) {
+			if (meetingPhaseEndMs > Date.now()) {
+				meetingPhaseTimeout = setTimeout(() => {
+					meetingPhaseTimeout = null;
+					if (meetingPhase === 'discussion') startMeetingPhase('voting');
+					else if (meetingPhase === 'voting') concludeVoting();
+				}, meetingPhaseEndMs - Date.now());
+			} else {
+				startMeetingPhase(meetingPhase === 'discussion' ? 'discussion' : 'voting');
+			}
+		}
 		impostorCompletedTasksByAuth = isRecord(saved.impostorCompletedTasksByAuth) ? saved.impostorCompletedTasksByAuth : Object.create(null);
 		if (isSabotageActive) {
 			const remainingMs = sabotageEndMs - Date.now();
