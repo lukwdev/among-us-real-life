@@ -48,7 +48,7 @@ Set a strong, private `ADMIN_CODE` in the **repository-root** `.env` file. The a
 
 Player access is protected by a randomly generated six-character code by default. The backend creates it once when no code is present in the persisted state, keeps it until the saved state is deleted or replaced, and shows it prominently in the authenticated admin panel. Players must enter this code before joining with their name. It is separate from `ADMIN_CODE`. To deliberately disable the player-code requirement, set `PLAYER_AUTH_REQUIRED=false`.
 
-For background meeting and game-win notifications, generate a VAPID key pair with `npx web-push generate-vapid-keys` and set both `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` in the root `.env`; leave both empty to disable push notifications. Set `PUSH_SUBJECT` to a contact email or an HTTPS URL. Keep the private key and `.env` out of source control.
+For background meeting, game-start, sabotage, voting-result, and game-win notifications, generate a VAPID key pair with `npx web-push generate-vapid-keys` and set both `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` in the root `.env`; leave both empty to disable push notifications. Set `PUSH_SUBJECT` to a contact email or an HTTPS URL. Keep the private key and `.env` out of source control.
 
 ```sh
 docker compose up --build -d
@@ -111,7 +111,7 @@ Pressing the start button will reset task progress, assign new tasks, and assign
 
 ### 5. Invite friends to join
 
-Players open the site on their phones and sign in with their name. They can opt in to meeting push notifications from the player screen. Push notifications are sent directly from this server using standard Web Push; Firebase is not required. Browser support varies, and iPhone/iPad users generally need to add the HTTPS site to their Home Screen before enabling web push. Notification delivery also depends on the browser and operating system.
+Players open the site on their phones and sign in with their name. They can opt in to game push notifications from the player screen. Push notifications are sent directly from this server using standard Web Push; Firebase is not required. Browser support varies, and iPhone/iPad users generally need to add the HTTPS site to their Home Screen before enabling web push. Notification delivery also depends on the browser and operating system.
 
 The existing in-page sounds alone do not cover a screen that is locked or a browser suspended in the background. A service worker and Web Push can alert players in that situation once they have opted in, but a web app cannot guarantee delivery if notifications are blocked, the device is offline, or the OS suppresses them.
 

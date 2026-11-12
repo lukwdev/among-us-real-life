@@ -7,7 +7,6 @@ import {
   Avatar, Paper
 } from '@mui/material';
 import MapIcon from '@mui/icons-material/Map';
-import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import CampaignIcon from '@mui/icons-material/Campaign';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import HowToVoteIcon from '@mui/icons-material/HowToVote';
@@ -64,7 +63,7 @@ function MeetingOverlay({
   players,
   authId,
   isDead,
-  votedPlayerIds,
+  voteCount,
   hasVoted,
   selectedTarget,
   onSelectTarget,
@@ -125,7 +124,7 @@ function MeetingOverlay({
                 label={
                   results
                     ? 'Voting Concluded'
-                    : `Votes Cast: ${votedPlayerIds.length} / ${living.length}`
+                    : `Votes Cast: ${voteCount} / ${living.length}`
                 }
                 color={results ? 'success' : 'default'}
                 variant="outlined"
@@ -158,7 +157,7 @@ function MeetingOverlay({
             <Card elevation={2}>
               <CardContent>
                 <Typography variant="subtitle1" fontWeight={700} gutterBottom>
-                  Vote Breakdown
+                  Anonymous Vote Breakdown
                 </Typography>
                 <Divider sx={{ mb: 1.5 }} />
                 <Stack spacing={1}>
@@ -169,21 +168,10 @@ function MeetingOverlay({
                     </Typography>
                     <Chip size="small" label={`${results.tallies?.['skip'] || 0}`} variant="outlined" />
                   </Stack>
-                  {Object.entries(results.votes || {}).filter(([, tgt]) => tgt === 'skip').length > 0 && (
-                    <Typography variant="caption" color="text.secondary" sx={{ mt: -0.5, display: 'block', pl: 1 }}>
-                      {Object.entries(results.votes || {})
-                        .filter(([, tgt]) => tgt === 'skip')
-                        .map(([vid]) => (players || []).find((p) => p.id === vid)?.name || vid)
-                        .join(', ')} voted to skip
-                    </Typography>
-                  )}
                   <Divider />
                   {/* Player rows */}
                   {living.map((candidate) => {
                     const tally = results.tallies?.[candidate.id] || 0;
-                    const voters = Object.entries(results.votes || {})
-                      .filter(([, tgt]) => tgt === candidate.id)
-                      .map(([vid]) => (players || []).find((p) => p.id === vid)?.name || vid);
                     const isEjected = results.ejected === candidate.id;
                     return (
                       <Box key={candidate.id}>
@@ -203,11 +191,6 @@ function MeetingOverlay({
                             variant={isEjected ? 'filled' : 'outlined'}
                           />
                         </Stack>
-                        {voters.length > 0 && (
-                          <Typography variant="caption" color="text.secondary" sx={{ pl: 4.5, display: 'block' }}>
-                            Voted by: {voters.join(', ')}
-                          </Typography>
-                        )}
                       </Box>
                     );
                   })}
@@ -238,7 +221,6 @@ function MeetingOverlay({
             <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.5 }}>
               {living.map((player) => {
                 const isSelected = selectedTarget === player.id;
-                const playerVoted = votedPlayerIds.includes(player.id);
                 const isSelf = player.id === authId;
                 const canVote = !hasVoted && !isDead;
 
@@ -282,9 +264,6 @@ function MeetingOverlay({
                           </Box>
                         </Stack>
                         <Stack direction="row" spacing={0.5} alignItems="center">
-                          {playerVoted && (
-                            <CheckCircleIcon color="success" sx={{ fontSize: 20 }} />
-                          )}
                           {canVote && (
                             <Radio
                               checked={isSelected}
@@ -435,6 +414,8 @@ export default function Player() {
     if (!audioInstanceRef.current) {
       audioInstanceRef.current = new Audio();
       audioInstanceRef.current.preload = 'auto';
+      audioInstanceRef.current.playsInline = true;
+      audioInstanceRef.current.setAttribute('playsinline', '');
     }
     if (!sabotageAudioRef.current) {
       sabotageAudioRef.current = new Audio('/sounds/sabotage.mp3');
@@ -480,7 +461,7 @@ export default function Player() {
   // Voting state
   const [playersList, setPlayersList] = useState([]);
   const [meetingCaller, setMeetingCaller] = useState(null);
-  const [votedPlayerIds, setVotedPlayerIds] = useState([]);
+  const [voteCount, setVoteCount] = useState(0);
   const [hasVoted, setHasVoted] = useState(false);
   const [selectedVoteTarget, setSelectedVoteTarget] = useState(null);
   const [votingResults, setVotingResults] = useState(null);
@@ -682,7 +663,7 @@ export default function Player() {
     socket.on('meeting-started', (payload) => {
       setMeeting(true);
       setMeetingCaller(payload?.caller || null);
-      setVotedPlayerIds([]);
+      setVoteCount(0);
       setHasVoted(false);
       setSelectedVoteTarget(null);
       setVotingResults(null);
@@ -691,7 +672,7 @@ export default function Player() {
     socket.on('meeting-ended', () => {
       setMeeting(false);
       setMeetingCaller(null);
-      setVotedPlayerIds([]);
+      setVoteCount(0);
       setHasVoted(false);
       setSelectedVoteTarget(null);
       setVotingResults(null);
@@ -699,13 +680,12 @@ export default function Player() {
     socket.on('meeting-state', (payload) => {
       setMeeting(!!payload?.isMeeting);
       if (payload?.caller) setMeetingCaller(payload.caller);
-      if (Array.isArray(payload?.votedPlayerIds)) setVotedPlayerIds(payload.votedPlayerIds);
+      if (typeof payload?.voteCount === 'number') setVoteCount(payload.voteCount);
       if (typeof payload?.hasVoted === 'boolean') setHasVoted(payload.hasVoted);
       if (payload?.results) setVotingResults(payload.results);
     });
-    socket.on('vote-cast', ({ voterId }) => {
-      if (!voterId) return;
-      setVotedPlayerIds((prev) => (prev.includes(voterId) ? prev : [...prev, voterId]));
+    socket.on('vote-cast', ({ totalVotes }) => {
+      if (typeof totalVotes === 'number') setVoteCount(totalVotes);
     });
     socket.on('voting-results', (results) => {
       setVotingResults(results || null);
@@ -729,7 +709,7 @@ export default function Player() {
       setGameActive(true);
       setMeeting(false);
       setMeetingCaller(null);
-      setVotedPlayerIds([]);
+      setVoteCount(0);
       setHasVoted(false);
       setSelectedVoteTarget(null);
       setVotingResults(null);
@@ -747,7 +727,7 @@ export default function Player() {
       setIsDead(false);
       setMeeting(false);
       setMeetingCaller(null);
-      setVotedPlayerIds([]);
+      setVoteCount(0);
       setHasVoted(false);
       setSelectedVoteTarget(null);
       setVotingResults(null);
@@ -765,7 +745,7 @@ export default function Player() {
       if (s?.sabotageMode === 'button' || s?.sabotageMode === 'qr') setSabotageMode(s.sabotageMode);
       if (Array.isArray(s?.players)) setPlayersList(s.players);
       if (s?.meetingCaller) setMeetingCaller(s.meetingCaller);
-      if (Array.isArray(s?.votedPlayerIds)) setVotedPlayerIds(s.votedPlayerIds);
+      if (typeof s?.voteCount === 'number') setVoteCount(s.voteCount);
       if (s?.meetingResults) setVotingResults(s.meetingResults);
     });
     socket.on('player-dead', () => {
@@ -1142,15 +1122,15 @@ export default function Player() {
     await new Promise((r) => setTimeout(r, ms));
   }
 
-  const UNLOCK_SOUND = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
-
   async function enableAudio() {
     const el = audioInstanceRef.current;
     if (!el) return;
     try {
-      el.src = UNLOCK_SOUND;
+      el.src = '/sounds/start.mp3';
+      el.load();
       await el.play();
       el.pause();
+      el.currentTime = 0;
       setAudioReady(true);
     } catch (error) {
       console.warn('Audio unlock deferred until user interaction:', error);
@@ -1158,24 +1138,17 @@ export default function Player() {
   }
 
   async function playSound(url) {
+    const el = audioInstanceRef.current;
+    if (!el) return;
     try {
-      const sound = new Audio(url);
-      sound.volume = 1.0;
-      await sound.play();
-      return;
-    } catch {
-      const el = audioInstanceRef.current;
-      if (el) {
-        try {
-          el.pause();
-          el.currentTime = 0;
-          el.src = url;
-          el.volume = 1.0;
-          await el.play();
-        } catch (error) {
-          console.warn('Audio playback blocked by browser:', error);
-        }
-      }
+      el.pause();
+      el.currentTime = 0;
+      el.src = url;
+      el.volume = 1.0;
+      el.load();
+      await el.play();
+    } catch (error) {
+      console.warn('Audio playback blocked by browser:', error);
     }
   }
 
@@ -1293,15 +1266,17 @@ export default function Player() {
         {playerName}
       </Typography>
       <Tooltip title={audioReady ? 'Game sound is active' : 'Click to enable game audio'}>
-        <Chip
+        <Button
+          type="button"
           size="small"
-          icon={audioReady ? <VolumeUpIcon /> : <VolumeOffIcon />}
-          label={audioReady ? 'Sound On' : 'Enable Sound'}
+          startIcon={audioReady ? <VolumeUpIcon /> : <VolumeOffIcon />}
+          variant={audioReady ? 'outlined' : 'contained'}
           color={audioReady ? 'default' : 'warning'}
-          variant={audioReady ? 'outlined' : 'filled'}
-          onClick={enableAudio}
-          sx={{ cursor: 'pointer', height: 24, fontSize: '0.75rem' }}
-        />
+          onClick={() => void enableAudio()}
+          sx={{ minHeight: 32, fontSize: '0.75rem', textTransform: 'none' }}
+        >
+          {audioReady ? 'Sound On' : 'Enable Sound'}
+        </Button>
       </Tooltip>
     </Stack>
   );
@@ -1364,7 +1339,7 @@ export default function Player() {
         {isConnected && pushMessage && <Alert severity={pushEnabled && Notification.permission === 'granted' ? 'success' : 'info'}>{pushMessage}</Alert>}
         {isConnected && pushEnabled && !pushSubscriptionSaved && (
           <Button variant="outlined" onClick={() => syncPushSubscription(socketRef.current, pushPublicKey, true)}>
-            Enable meeting notifications
+            Enable game notifications
           </Button>
         )}
         <Card sx={{ width: '100%', maxWidth: 420 }}>
@@ -1415,7 +1390,7 @@ export default function Player() {
           players={playersList}
           authId={authId}
           isDead={isDead}
-          votedPlayerIds={votedPlayerIds}
+          voteCount={voteCount}
           hasVoted={hasVoted}
           selectedTarget={selectedVoteTarget}
           onSelectTarget={setSelectedVoteTarget}
@@ -1701,7 +1676,7 @@ export default function Player() {
         players={playersList}
         authId={authId}
         isDead={isDead}
-        votedPlayerIds={votedPlayerIds}
+        voteCount={voteCount}
         hasVoted={hasVoted}
         selectedTarget={selectedVoteTarget}
         onSelectTarget={setSelectedVoteTarget}

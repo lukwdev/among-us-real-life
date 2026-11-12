@@ -969,6 +969,11 @@ io.on('connection', socket => {
 		emergencyCooldownEndMs = 0;
 		lastMeetingType = null;
 		io.emit('game-started');
+		void sendPushNotification(
+			'Game started',
+			'The game has started. Check your tasks and role.',
+			'among-us-game-started'
+		);
 		io.emit('state', getStateSnapshot(false));
 		broadcastGamemasterUpdate();
 		io.emit('cooldown-updated', { emergencyCooldownEndMs });
@@ -1038,7 +1043,7 @@ io.on('connection', socket => {
 		if (target !== 'skip' && !livingPlayers.includes(target)) return;
 
 		meetingVotes[voterAuth] = target;
-		io.emit('vote-cast', { voterId: voterAuth, totalVotes: Object.keys(meetingVotes).length });
+		io.emit('vote-cast', { totalVotes: Object.keys(meetingVotes).length });
 		schedulePersist();
 		console.log('[cast-vote]', { voter: voterAuth, target });
 
@@ -1530,6 +1535,12 @@ io.on('connection', socket => {
 	});
 });
 
+function getPublicVotingResults(results) {
+	if (!results) return null;
+	const { votes, ...publicResults } = results;
+	return publicResults;
+}
+
 function concludeVoting() {
 	if (!isMeeting || meetingResults) return;
 
@@ -1564,8 +1575,17 @@ function concludeVoting() {
 		appendGameLog('voting-tie', 'No one was ejected (Skipped or tie).');
 	}
 
-	io.emit('voting-results', meetingResults);
+	io.emit('voting-results', getPublicVotingResults(meetingResults));
 	io.emit('play-vote-result');
+	void sendPushNotification(
+		meetingResults.ejected
+			? `${meetingResults.ejectedName} was ejected`
+			: 'Voting complete',
+		meetingResults.ejected
+			? 'The meeting is over. Check the game for the result.'
+			: 'No one was ejected. The meeting is over.',
+		'among-us-vote-result'
+	);
 
 	broadcastPlayersToAdmins();
 	broadcastGamemasterUpdate();
@@ -1710,8 +1730,8 @@ function getStateSnapshot(includeAdminData) {
 			: sabotageDefuserAuths.size,
 		gameWinner,
 		meetingCaller,
-		votedPlayerIds: Object.keys(meetingVotes),
-		meetingResults,
+		voteCount: Object.keys(meetingVotes).length,
+		meetingResults: getPublicVotingResults(meetingResults),
 		playerJoinCode: includeAdminData && playerJoinCodeRequired ? playerJoinCode : undefined,
 		taskCollections: includeAdminData ? getTaskCollectionsSnapshot() : undefined,
 		selectedTaskCollectionId: includeAdminData ? selectedTaskCollectionId : undefined,
@@ -1833,9 +1853,9 @@ function sendPlayerSnapshot(socket, playerId) {
 		socket.emit('meeting-state', {
 			isMeeting: true,
 			caller: meetingCaller,
-			votedPlayerIds: Object.keys(meetingVotes),
+			voteCount: Object.keys(meetingVotes).length,
 			hasVoted: Boolean(meetingVotes[playerId]),
-			results: meetingResults
+			results: getPublicVotingResults(meetingResults)
 		});
 	}
 }
