@@ -150,13 +150,25 @@ if (pushEnabled) {
 
 const app = express();
 const server = http.createServer(app);
+const socketRecoveryMinutes = Math.max(
+	1,
+	Number.parseInt(process.env.SOCKET_RECOVERY_MINUTES || '30', 10)
+);
 const io = new Server(server, {
 	cors: {
 		origin: process.env.CORS_ORIGIN
 			? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim())
 			: false,
 		methods: ['GET', 'POST']
-	}
+	},
+	// Preserve server events during short mobile/Wi-Fi interruptions. The
+	// player still receives a complete state snapshot after reconnecting.
+	connectionStateRecovery: {
+		maxDisconnectionDuration: socketRecoveryMinutes * 60 * 1000,
+		skipMiddlewares: false
+	},
+	pingInterval: 10000,
+	pingTimeout: 30000
 });
 
 const TASKS = [

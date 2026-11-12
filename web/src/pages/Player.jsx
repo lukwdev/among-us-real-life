@@ -505,7 +505,14 @@ export default function Player() {
 
   useEffect(() => {
     if (!playerName) return;
-    const socket = io({ query: { role: 'PLAYER' } });
+    const socket = io({
+      query: { role: 'PLAYER' },
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 10000,
+      timeout: 20000
+    });
     socketRef.current = socket;
 
     socket.on('connect', () => {
@@ -569,6 +576,7 @@ export default function Player() {
       });
     });
     socket.on('disconnect', () => setIsConnected(false));
+    socket.on('connect_error', () => setIsConnected(false));
     socket.on('player-removed', () => {
       try {
         localStorage.removeItem('playerName');
@@ -815,7 +823,15 @@ export default function Player() {
       }
     });
 
+    const reconnectWhenVisible = () => {
+      if (document.visibilityState === 'visible' && !socket.connected) {
+        socket.connect();
+      }
+    };
+    document.addEventListener('visibilitychange', reconnectWhenVisible);
+
     return () => {
+      document.removeEventListener('visibilitychange', reconnectWhenVisible);
       socket.disconnect();
     };
   }, [playerName, loginAttempt]);

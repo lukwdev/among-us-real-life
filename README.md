@@ -50,6 +50,9 @@ Player access is protected by a randomly generated six-character code by default
 
 For background meeting, game-start, sabotage, voting-result, and game-win notifications, generate a VAPID key pair with `npx web-push generate-vapid-keys` and set both `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` in the root `.env`; leave both empty to disable push notifications. Set `PUSH_SUBJECT` to a contact email or an HTTPS URL. Keep the private key and `.env` out of source control.
 
+
+Socket.IO buffers missed events for player reconnects for 30 minutes by default. Change `SOCKET_RECOVERY_MINUTES` in the root `.env` if a different recovery window is needed.
+
 ```sh
 docker compose up --build -d
 docker compose logs -f
